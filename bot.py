@@ -254,7 +254,7 @@ def toggle_event_status(event_id, field):
     
     conn.commit()
     conn.close()
-    return action
+    return new_value == 1, action
 
 def delete_event(event_id):
     """Удаляет мероприятие"""
@@ -1200,9 +1200,16 @@ async def manage_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     try:
-        event_id = int(query.data.split('_')[1])
+        # Извлекаем event_id из callback_data
+        if query.data.startswith('manage_'):
+            event_id = int(query.data.split('_')[1])
+        else:
+            # Если это действие (вкл/выкл), обновляем страницу без ошибки
+            await admin_manage_events(update, context)
+            return
     except:
-        await query.edit_message_text("❌ Ошибка: неверный ID мероприятия")
+        # Если ошибка, просто возвращаемся к списку
+        await admin_manage_events(update, context)
         return
     
     event = get_event_details(event_id)
@@ -1236,26 +1243,26 @@ async def manage_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Создаем кнопки управления
     keyboard = []
     
-    # Кнопки для управления статусом
+    # ОДНА кнопка для переключения статуса активности
     if is_active == 1:
-        keyboard.append([InlineKeyboardButton("❌ Деактивировать мероприятие", callback_data=f'deactivate_event_{event_id}')])
+        keyboard.append([InlineKeyboardButton("❌ Деактивировать мероприятие", callback_data=f'toggle_active_{event_id}')])
     else:
-        keyboard.append([InlineKeyboardButton("✅ Активировать мероприятие", callback_data=f'activate_event_{event_id}')])
+        keyboard.append([InlineKeyboardButton("✅ Активировать мероприятие", callback_data=f'toggle_active_{event_id}')])
     
-    # Кнопки для управления записью
+    # ОДНА кнопка для управления записью
     if registration_open == 1:
-        keyboard.append([InlineKeyboardButton("🔒 Закрыть запись", callback_data=f'close_registration_{event_id}')])
+        keyboard.append([InlineKeyboardButton("🔒 Закрыть запись", callback_data=f'toggle_registration_{event_id}')])
     else:
-        keyboard.append([InlineKeyboardButton("📝 Открыть запись", callback_data=f'open_registration_{event_id}')])
+        keyboard.append([InlineKeyboardButton("📝 Открыть запись", callback_data=f'toggle_registration_{event_id}')])
     
     # Кнопки для редактирования
-    keyboard.append([InlineKeyboardButton("✏️ Изменить данные", callback_data=f'edit_event_{event_id}')])
+    keyboard.append([InlineKeyboardButton("✏️ Изменить данные", callback_data=f'edit_{event_id}')])
     
     # Кнопка удаления
-    keyboard.append([InlineKeyboardButton("🗑️ Удалить мероприятие", callback_data=f'delete_event_{event_id}')])
+    keyboard.append([InlineKeyboardButton("🗑️ Удалить мероприятие", callback_data=f'delete_{event_id}')])
     
     # Кнопка просмотра записавшихся
-    keyboard.append([InlineKeyboardButton("👥 Просмотреть записавшихся", callback_data=f'view_registrations_{event_id}')])
+    keyboard.append([InlineKeyboardButton("👥 Просмотреть записавшихся", callback_data=f'view_{event_id}')])
     
     keyboard.append([InlineKeyboardButton("◀️ Назад к списку", callback_data='admin_manage')])
     keyboard.append([InlineKeyboardButton("🏠 В админ-панель", callback_data='admin_back')])
@@ -1269,7 +1276,7 @@ async def manage_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_event_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает действия с мероприятиями"""
+    """Обрабатывает действия с мероприятиями - УПРОЩЕННАЯ ВЕРСИЯ"""
     query = update.callback_query
     await query.answer()
     
@@ -1280,40 +1287,47 @@ async def handle_event_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Разбираем callback_data
         data_parts = query.data.split('_')
         
-        if len(data_parts) >= 3:
-            action = data_parts[0] + '_' + data_parts[1]  # Например: 'deactivate_event', 'close_registration'
-            event_id = int(data_parts[2])
-        else:
-            await query.edit_message_text("❌ Ошибка обработки действия")
+        if len(data_parts) < 2:
+            # Просто обновляем страницу
+            await manage_event(update, context)
             return
+        
+        action = data_parts[0]
+        event_id = int(data_parts[1])
     except:
-        await query.edit_message_text("❌ Ошибка обработки действия")
+        # Если ошибка, просто возвращаемся к управлению
+        await admin_manage_events(update, context)
         return
     
     event = get_event_details(event_id)
     if not event:
-        await query.edit_message_text("❌ Мероприятие не найдено.")
+        # Если мероприятие не найдено, возвращаемся к списку
+        await admin_manage_events(update, context)
         return
     
     title = event[0]
     
-    if action == 'activate_event':
-        action_text = toggle_event_status(event_id, 'is_active')
-        message = f"✅ Мероприятие '{title}' активировано."
+    if action == 'toggle':  # toggle_active или toggle_registration
+        if len(data_parts) > 2 and data_parts[1] == 'active':
+            # Переключаем активность
+            is_now_active, action_text = toggle_event_status(event_id, 'is_active')
+            if is_now_active:
+                message = f"✅ Мероприятие '{title}' активировано."
+            else:
+                message = f"❌ Мероприятие '{title}' деактивировано."
+        
+        elif len(data_parts) > 2 and data_parts[1] == 'registration':
+            # Переключаем запись
+            is_now_open, action_text = toggle_event_status(event_id, 'registration_open')
+            if is_now_open:
+                message = f"📝 Запись на мероприятие '{title}' открыта."
+            else:
+                message = f"🔒 Запись на мероприятие '{title}' закрыта."
+        
+        else:
+            message = "❌ Неизвестное действие."
     
-    elif action == 'deactivate_event':
-        action_text = toggle_event_status(event_id, 'is_active')
-        message = f"❌ Мероприятие '{title}' деактивировано."
-    
-    elif action == 'open_registration':
-        action_text = toggle_event_status(event_id, 'registration_open')
-        message = f"📝 Запись на мероприятие '{title}' открыта."
-    
-    elif action == 'close_registration':
-        action_text = toggle_event_status(event_id, 'registration_open')
-        message = f"🔒 Запись на мероприятие '{title}' закрыта."
-    
-    elif action == 'delete_event':
+    elif action == 'delete':
         if delete_event(event_id):
             message = f"🗑️ Мероприятие '{title}' удалено."
             # Возвращаемся к списку
@@ -1322,7 +1336,7 @@ async def handle_event_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             message = f"❌ Ошибка при удалении мероприятия."
     
-    elif action == 'edit_event':
+    elif action == 'edit':
         context.user_data['editing_event_id'] = event_id
         context.user_data['editing_field'] = None
         
@@ -1345,7 +1359,7 @@ async def handle_event_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
     
-    elif action == 'view_registrations':
+    elif action == 'view':
         conn = sqlite3.connect(DB_NAME)
         cur = conn.cursor()
         cur.execute('''
@@ -1388,10 +1402,16 @@ async def handle_event_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     else:
-        message = "❌ Неизвестное действие."
+        # Неизвестное действие - просто обновляем
+        await manage_event(update, context)
+        return
     
-    # Показываем сообщение об успехе и возвращаемся к управлению
+    # Показываем сообщение об успехе
     await query.answer(message, show_alert=True)
+    
+    # Небольшая задержка перед обновлением
+    await asyncio.sleep(0.5)
+    
     # Обновляем меню управления
     await manage_event(update, context)
 
@@ -1944,7 +1964,7 @@ def main():
     
     # Обработчики управления мероприятиями
     application.add_handler(CallbackQueryHandler(manage_event, pattern='^manage_'))
-    application.add_handler(CallbackQueryHandler(handle_event_action, pattern='^(activate_event|deactivate_event|close_registration|open_registration|delete_event|edit_event|view_registrations)_'))
+    application.add_handler(CallbackQueryHandler(handle_event_action, pattern='^(toggle|delete|edit|view)_'))
     
     # Обработчик сообщений для добавления мероприятий из кнопок
     application.add_handler(MessageHandler(
