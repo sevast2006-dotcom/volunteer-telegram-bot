@@ -183,7 +183,9 @@ def count_csv_lines():
 def get_event_csv(event_id):
     """Создает CSV файл для конкретного мероприятия"""
     try:
-        event_file = f"event_{event_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        # Создаем уникальное имя файла
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        event_file = f"event_{event_id}_{timestamp}.csv"
         
         conn = sqlite3.connect(DB_NAME)
         cur = conn.cursor()
@@ -218,7 +220,6 @@ def get_event_csv(event_id):
             writer.writerow([f"Мероприятие: {event_title}"])
             writer.writerow([f"Дата: {event_date} Время: {event_time}"])
             writer.writerow([f"Место: {event_location}"])
-            writer.writerow([])
             writer.writerow([])
             
             # Записываем заголовки таблицы
@@ -305,11 +306,9 @@ def toggle_event_registration(event_id):
     current = cur.fetchone()[0]
     new_value = 0 if current == 1 else 1
     cur.execute('UPDATE events SET registration_open = ? WHERE id = ?', (new_value, event_id))
-    action = "открыта" if new_value == 1 else "закрыта"
-    
     conn.commit()
     conn.close()
-    return new_value == 1, action
+    return new_value == 1  # True если запись открыта, False если закрыта
 
 def delete_event(event_id):
     """Удаляет мероприятие"""
@@ -1322,7 +1321,7 @@ async def manage_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if query.data.startswith('manage_'):
             event_id = int(query.data.split('_')[1])
         else:
-            # Если это действие (вкл/выкл), обновляем страницу без ошибки
+            # Если это действие, обновляем страницу
             await admin_manage_events(update, context)
             return
     except:
@@ -1363,12 +1362,12 @@ async def manage_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Кнопка для открытия/закрытия записи
     if registration_open == 1:
-        keyboard.append([InlineKeyboardButton("🔒 Закрыть запись", callback_data=f'toggle_registration_{event_id}')])
+        keyboard.append([InlineKeyboardButton("🔒 Закрыть запись", callback_data=f'toggle_reg_{event_id}')])
     else:
-        keyboard.append([InlineKeyboardButton("📝 Открыть запись", callback_data=f'toggle_registration_{event_id}')])
+        keyboard.append([InlineKeyboardButton("📝 Открыть запись", callback_data=f'toggle_reg_{event_id}')])
     
     # Кнопка для скачивания таблицы мероприятия
-    keyboard.append([InlineKeyboardButton("📥 Скачать таблицу мероприятия", callback_data=f'download_csv_{event_id}')])
+    keyboard.append([InlineKeyboardButton("📥 Скачать таблицу мероприятия", callback_data=f'download_event_{event_id}')])
     
     # Кнопки для редактирования
     keyboard.append([InlineKeyboardButton("✏️ Изменить данные", callback_data=f'edit_{event_id}')])
@@ -1422,9 +1421,9 @@ async def handle_event_action(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     title = event[0]
     
-    if action == 'toggle' and data_parts[1] == 'registration':
+    if action == 'toggle' and data_parts[1] == 'reg':
         # Переключаем запись
-        is_now_open, action_text = toggle_event_registration(event_id)
+        is_now_open = toggle_event_registration(event_id)
         if is_now_open:
             message = f"📝 Запись на мероприятие '{title}' открыта."
         else:
@@ -1435,7 +1434,62 @@ async def handle_event_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         await manage_event(update, context)
         return
     
+    elif action == 'download' and data_parts[1] == 'event':
+        # Создаем CSV файл для мероприятия
+        event_file = get_event_csv(event_id)
+        
+        if event_file:
+            try:
+                with open(event_file, 'rb') as f:
+                    await context.bot.send_document(
+                        chat_id=query.from_user.id,
+                        document=f,
+                        filename=f'мероприятие_{event_id}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv',
+                        caption=f"📊 Таблица участников мероприятия: {title}"
+                    )
+                
+                # Удаляем временный файл
+                os.remove(event_file)
+                
+                # Возвращаемся к управлению
+                await asyncio.sleep(0.5)
+                await manage_event(update, context)
+                return
+                
+            except Exception as e:
+                print(f"❌ Ошибка при отправке CSV: {e}")
+                await query.answer("❌ Ошибка при создании файла", show_alert=True)
+        else:
+            await query.answer("❌ Ошибка при создании файла", show_alert=True)
+        
+        await asyncio.sleep(0.5)
+        await manage_event(update, context)
+        return
+    
     elif action == 'delete':
+        # Подтверждение удаления
+        keyboard = [
+            [InlineKeyboardButton("✅ Да, удалить", callback_data=f'confirm_delete_{event_id}')],
+            [InlineKeyboardButton("❌ Нет, отменить", callback_data=f'manage_{event_id}')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"⚠️ *Вы уверены, что хотите удалить мероприятие?*\n\n"
+            f"🎯 *Название:* {title}\n\n"
+            f"Это действие удалит:\n"
+            f"• Само мероприятие\n"
+            f"• Все записи на него\n"
+            f"• Все данные из таблицы CSV\n\n"
+            f"*Действие необратимо!*",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        return
+    
+    elif action == 'confirm' and data_parts[1] == 'delete':
+        # Подтвержденное удаление
+        event_id = int(data_parts[2])
         if delete_event(event_id):
             message = f"🗑️ Мероприятие '{title}' удалено."
             # Возвращаемся к списку
@@ -1443,6 +1497,10 @@ async def handle_event_action(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         else:
             message = f"❌ Ошибка при удалении мероприятия."
+            await query.answer(message, show_alert=True)
+            await asyncio.sleep(0.5)
+            await admin_manage_events(update, context)
+            return
     
     elif action == 'edit':
         context.user_data['editing_event_id'] = event_id
@@ -1512,51 +1570,10 @@ async def handle_event_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
     
-    elif action == 'download' and data_parts[1] == 'csv':
-        # Создаем CSV файл для мероприятия
-        event_file = get_event_csv(event_id)
-        
-        if event_file:
-            try:
-                with open(event_file, 'rb') as f:
-                    await context.bot.send_document(
-                        chat_id=query.from_user.id,
-                        document=f,
-                        filename=f'мероприятие_{event_id}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv',
-                        caption=f"📊 Таблица участников мероприятия: {title}"
-                    )
-                
-                # Удаляем временный файл
-                os.remove(event_file)
-                
-                # Возвращаемся к управлению
-                await asyncio.sleep(0.5)
-                await manage_event(update, context)
-                return
-                
-            except Exception as e:
-                print(f"❌ Ошибка при отправке CSV: {e}")
-                await query.answer("❌ Ошибка при создании файла", show_alert=True)
-        else:
-            await query.answer("❌ Ошибка при создании файла", show_alert=True)
-        
-        await asyncio.sleep(0.5)
-        await manage_event(update, context)
-        return
-    
     else:
         # Неизвестное действие - просто обновляем
         await manage_event(update, context)
         return
-    
-    # Показываем сообщение об успехе
-    await query.answer(message, show_alert=True)
-    
-    # Небольшая задержка перед обновлением
-    await asyncio.sleep(0.5)
-    
-    # Обновляем меню управления
-    await manage_event(update, context)
 
 async def edit_event_field_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начинает редактирование поля мероприятия"""
@@ -2118,7 +2135,7 @@ def main():
     
     # Обработчики управления мероприятиями
     application.add_handler(CallbackQueryHandler(manage_event, pattern='^manage_'))
-    application.add_handler(CallbackQueryHandler(handle_event_action, pattern='^(toggle|delete|edit|view|download)_'))
+    application.add_handler(CallbackQueryHandler(handle_event_action, pattern='^(toggle_reg|download_event|edit|view|delete|confirm_delete)_'))
     
     # Обработчик сообщений для добавления мероприятий из кнопок
     application.add_handler(MessageHandler(
