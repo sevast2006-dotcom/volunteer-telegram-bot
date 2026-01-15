@@ -725,26 +725,43 @@ async def admin_add_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
     
+    context.user_data['adding_event'] = True
     return ADDING_EVENT
 
 async def save_new_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сохраняет новое мероприятие из сообщения"""
+    # Проверяем, что это именно админ и он в режиме добавления
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ У вас нет прав доступа.")
+        return ConversationHandler.END
+    
     text = update.message.text.strip()
     
     if text.lower() == '/cancel':
-        await update.message.reply_text("❌ Добавление мероприятия отменено.")
+        await update.message.reply_text("✅ Добавление мероприятия отменено.")
         return ConversationHandler.END
     
     parts = [part.strip() for part in text.split(',')]
     
     if len(parts) >= 5:
         try:
-            title = parts[0]
-            description = parts[1] if len(parts) > 5 else ""
-            date = parts[-4] if len(parts) > 5 else parts[1]
-            time = parts[-3] if len(parts) > 5 else parts[2]
-            location = parts[-2] if len(parts) > 5 else parts[3]
-            max_volunteers = int(parts[-1]) if parts[-1].isdigit() else 0
+            # Определяем части в зависимости от количества
+            if len(parts) == 5:
+                # Формат без описания: Название, Дата, Время, Место, Макс
+                title = parts[0]
+                description = ""
+                date = parts[1]
+                time = parts[2]
+                location = parts[3]
+                max_volunteers = int(parts[4]) if parts[4].isdigit() else 0
+            else:
+                # Формат с описанием: Название, Описание, Дата, Время, Место, Макс
+                title = parts[0]
+                description = parts[1]
+                date = parts[2]
+                time = parts[3]
+                location = parts[4]
+                max_volunteers = int(parts[5]) if parts[5].isdigit() else 0
             
             # Проверяем формат даты
             try:
@@ -780,7 +797,7 @@ async def save_new_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.close()
             
             # Формируем ответ
-            text = (
+            response_text = (
                 "✅ *Мероприятие добавлено!*\n\n"
                 f"🎯 *Название:* {title}\n"
                 f"📅 *Дата:* {date}\n"
@@ -790,24 +807,25 @@ async def save_new_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             
             if description:
-                text += f"📝 *Описание:* {description}\n"
+                response_text += f"📝 *Описание:* {description}\n"
             
-            text += f"\n🆔 *ID мероприятия:* {event_id}"
+            response_text += f"\n🆔 *ID мероприятия:* {event_id}"
             
-            await update.message.reply_text(text, parse_mode='Markdown')
+            await update.message.reply_text(response_text, parse_mode='Markdown')
             
             print(f"✅ Добавлено мероприятие: {title} (ID: {event_id})")
             
         except Exception as e:
+            print(f"❌ Ошибка при добавлении мероприятия: {e}")
             await update.message.reply_text(
-                f"❌ Ошибка: {e}\n\n"
+                f"❌ Ошибка: {str(e)[:200]}\n\n"
                 "Проверьте правильность ввода данных и попробуйте еще раз.\n"
                 "Для отмены отправьте /cancel"
             )
             return ADDING_EVENT
     else:
         await update.message.reply_text(
-            "❌ *Неверный формат!*\n\n"
+            "❌ *Неверный формат!* Требуется минимум 5 полей.\n\n"
             "Отправьте данные в формате:\n"
             "`Название, Описание, Дата, Время, Место, Макс. участников`\n\n"
             "*Пример:*\n"
@@ -816,6 +834,10 @@ async def save_new_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
         return ADDING_EVENT
+    
+    # Сбрасываем флаг
+    if 'adding_event' in context.user_data:
+        del context.user_data['adding_event']
     
     return ConversationHandler.END
 
@@ -923,6 +945,11 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /cancel"""
     await update.message.reply_text("✅ Операция отменена.")
+    
+    # Сбрасываем флаги
+    if 'adding_event' in context.user_data:
+        del context.user_data['adding_event']
+    
     return ConversationHandler.END
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -932,10 +959,10 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     keyboard = [
-        [InlineKeyboardButton("➕ Добавить мероприятие", callback_data='admin_add_event_btn')],
-        [InlineKeyboardButton("📋 Все мероприятия", callback_data='admin_list_events_btn')],
-        [InlineKeyboardButton("📊 Статистика", callback_data='admin_stats_btn')],
-        [InlineKeyboardButton("📥 Скачать таблицу", callback_data='admin_download_btn')]
+        [InlineKeyboardButton("➕ Добавить мероприятие", callback_data='admin_add_event')],
+        [InlineKeyboardButton("📋 Все мероприятия", callback_data='admin_list_events')],
+        [InlineKeyboardButton("📊 Статистика", callback_data='admin_stats')],
+        [InlineKeyboardButton("📥 Скачать таблицу", callback_data='admin_table')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -948,7 +975,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== ИСПРАВЛЕННЫЕ ФУНКЦИИ КНОПОК ==========
 async def admin_add_event_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик кнопки добавления мероприятия"""
+    """Обработчик кнопки добавления мероприятия (из админ-панели)"""
     query = update.callback_query
     await query.answer()
     
@@ -970,7 +997,8 @@ async def admin_add_event_btn(update: Update, context: ContextTypes.DEFAULT_TYPE
         parse_mode='Markdown'
     )
     
-    context.user_data['state'] = ADDING_EVENT
+    context.user_data['adding_event'] = True
+    context.user_data['from_callback'] = True
 
 async def admin_list_events_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопки списка мероприятий"""
@@ -1062,7 +1090,7 @@ async def admin_stats_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
 
-async def admin_download_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_table_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопки скачивания таблицы"""
     query = update.callback_query
     await query.answer()
@@ -1105,10 +1133,10 @@ async def admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     keyboard = [
-        [InlineKeyboardButton("➕ Добавить мероприятие", callback_data='admin_add_event_btn')],
-        [InlineKeyboardButton("📋 Все мероприятия", callback_data='admin_list_events_btn')],
-        [InlineKeyboardButton("📊 Статистика", callback_data='admin_stats_btn')],
-        [InlineKeyboardButton("📥 Скачать таблицу", callback_data='admin_download_btn')]
+        [InlineKeyboardButton("➕ Добавить мероприятие", callback_data='admin_add_event')],
+        [InlineKeyboardButton("📋 Все мероприятия", callback_data='admin_list_events')],
+        [InlineKeyboardButton("📊 Статистика", callback_data='admin_stats')],
+        [InlineKeyboardButton("📥 Скачать таблицу", callback_data='admin_table')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -1118,6 +1146,19 @@ async def admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+
+# ========== ОБРАБОТЧИК СООБЩЕНИЙ ДЛЯ ДОБАВЛЕНИЯ МЕРОПРИЯТИЙ ==========
+async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает сообщения от админа для добавления мероприятий"""
+    # Проверяем, что это админ и он в режиме добавления мероприятия
+    if update.effective_user.id != ADMIN_ID:
+        return
+    
+    if context.user_data.get('adding_event'):
+        await save_new_event(update, context)
+    else:
+        # Если сообщение не связано с добавлением мероприятия, игнорируем
+        pass
 
 # ========== ОБРАБОТЧИК ОШИБОК ==========
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1137,7 +1178,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except:
                 pass
     
-    return
+    return ConversationHandler.END
 
 # ========== ОСНОВНАЯ ФУНКЦИЯ ==========
 def main():
@@ -1167,12 +1208,9 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel_command)]
     )
     
-    # Создаем ConversationHandler для добавления мероприятий
+    # Создаем ConversationHandler для добавления мероприятий (из команд)
     add_event_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler('addevent', admin_add_event),
-            CallbackQueryHandler(admin_add_event_btn, pattern='^admin_add_event_btn$')
-        ],
+        entry_points=[CommandHandler('addevent', admin_add_event)],
         states={
             ADDING_EVENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_new_event)],
         },
@@ -1200,10 +1238,17 @@ def main():
     application.add_handler(CallbackQueryHandler(main_menu, pattern='^main_menu$'))
     
     # Админ обработчики кнопок
-    application.add_handler(CallbackQueryHandler(admin_list_events_btn, pattern='^admin_list_events_btn$'))
-    application.add_handler(CallbackQueryHandler(admin_stats_btn, pattern='^admin_stats_btn$'))
-    application.add_handler(CallbackQueryHandler(admin_download_btn, pattern='^admin_download_btn$'))
+    application.add_handler(CallbackQueryHandler(admin_add_event_btn, pattern='^admin_add_event$'))
+    application.add_handler(CallbackQueryHandler(admin_list_events_btn, pattern='^admin_list_events$'))
+    application.add_handler(CallbackQueryHandler(admin_stats_btn, pattern='^admin_stats$'))
+    application.add_handler(CallbackQueryHandler(admin_table_btn, pattern='^admin_table$'))
     application.add_handler(CallbackQueryHandler(admin_back, pattern='^admin_back$'))
+    
+    # Обработчик сообщений для добавления мероприятий из кнопок
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.User(user_id=ADMIN_ID),
+        handle_admin_message
+    ))
     
     print("✅ Бот запущен и ожидает сообщений...")
     print("=" * 50)
