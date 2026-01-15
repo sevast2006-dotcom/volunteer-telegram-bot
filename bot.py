@@ -258,7 +258,7 @@ def get_active_events():
           AND events.registration_open = 1
           AND events.date >= date('now')
         GROUP BY events.id
-        HAVING available_spots > 0 OR events.max_volunteers IS NULL
+        HAVING available_spots > 0 OR events.max_volunteers IS NULL OR events.max_volunteers = 0
         ORDER BY events.date, events.time
     ''')
     events = cur.fetchall()
@@ -290,7 +290,7 @@ def get_user_registrations(user_id):
                registrations.comment
         FROM registrations
         JOIN events ON registrations.event_id = events.id
-        WHERE registrations.user_id = ? AND events.date >= date('now')
+        WHERE registrations.user_id = ? AND events.date >= date('now') AND events.is_active = 1
         ORDER BY events.date, events.time
     ''', (user_id,))
     events = cur.fetchall()
@@ -309,6 +309,19 @@ def toggle_event_registration(event_id):
     conn.commit()
     conn.close()
     return new_value == 1  # True если запись открыта, False если закрыта
+
+def toggle_event_active_status(event_id):
+    """Активирует/деактивирует мероприятие"""
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    
+    cur.execute('SELECT is_active FROM events WHERE id = ?', (event_id,))
+    current = cur.fetchone()[0]
+    new_value = 0 if current == 1 else 1
+    cur.execute('UPDATE events SET is_active = ? WHERE id = ?', (new_value, event_id))
+    conn.commit()
+    conn.close()
+    return new_value == 1  # True если активно, False если неактивно
 
 def delete_event(event_id):
     """Удаляет мероприятие"""
@@ -515,7 +528,7 @@ async def event_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Получаем информацию о мероприятии
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-    cur.execute('SELECT title, description, date, time, location, max_volunteers, registration_open FROM events WHERE id = ?', (event_id,))
+    cur.execute('SELECT title, description, date, time, location, max_volunteers, registration_open, is_active FROM events WHERE id = ?', (event_id,))
     event = cur.fetchone()
     
     if not event:
@@ -523,7 +536,18 @@ async def event_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         return
     
-    title, desc, date, time, location, max_vol, registration_open = event
+    title, desc, date, time, location, max_vol, registration_open, is_active = event
+    
+    # Проверяем, активно ли мероприятие
+    if not is_active:
+        await query.edit_message_text(
+            "❌ *Это мероприятие временно недоступно.*\n\n"
+            "Оно было деактивировано организаторами.\n\n"
+            "Пожалуйста, выберите другое мероприятие.",
+            parse_mode='Markdown'
+        )
+        conn.close()
+        return
     
     # Проверяем, записан ли пользователь
     cur.execute('SELECT id FROM registrations WHERE user_id = ? AND event_id = ?', 
@@ -818,7 +842,7 @@ async def save_registration_with_comment(update: Update, context: ContextTypes.D
         return ConversationHandler.END
     
     # 2. Проверяем мероприятие и открыта ли запись
-    cur.execute('SELECT title, date, time, location, max_volunteers, registration_open FROM events WHERE id = ?', (event_id,))
+    cur.execute('SELECT title, date, time, location, max_volunteers, registration_open, is_active FROM events WHERE id = ?', (event_id,))
     event = cur.fetchone()
     
     if not event:
@@ -828,7 +852,15 @@ async def save_registration_with_comment(update: Update, context: ContextTypes.D
             del context.user_data['registering_event_id']
         return ConversationHandler.END
     
-    title, date, time, location, max_vol, registration_open = event
+    title, date, time, location, max_vol, registration_open, is_active = event
+    
+    # Проверяем, активно ли мероприятие
+    if not is_active:
+        await update.message.reply_text("❌ Это мероприятие временно недоступно!")
+        conn.close()
+        if 'registering_event_id' in context.user_data:
+            del context.user_data['registering_event_id']
+        return ConversationHandler.END
     
     if not registration_open:
         await update.message.reply_text("❌ Запись на это мероприятие закрыта!")
@@ -1360,6 +1392,12 @@ async def manage_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Создаем кнопки управления
     keyboard = []
     
+    # Кнопка для активации/деактивации мероприятия
+    if is_active == 1:
+        keyboard.append([InlineKeyboardButton("❌ Деактивировать мероприятие", callback_data=f'toggle_active_{event_id}')])
+    else:
+        keyboard.append([InlineKeyboardButton("✅ Активировать мероприятие", callback_data=f'toggle_active_{event_id}')])
+    
     # Кнопка для открытия/закрытия записи
     if registration_open == 1:
         keyboard.append([InlineKeyboardButton("🔒 Закрыть запись", callback_data=f'toggle_reg_{event_id}')])
@@ -1417,6 +1455,40 @@ async def toggle_registration_handler(update: Update, context: ContextTypes.DEFA
         message = f"📝 Запись на мероприятие '{title}' открыта."
     else:
         message = f"🔒 Запись на мероприятие '{title}' закрыта."
+    
+    await query.answer(message, show_alert=True)
+    
+    # Обновляем страницу
+    await asyncio.sleep(0.5)
+    await manage_event(update, context)
+
+async def toggle_active_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает кнопку активации/деактивации мероприятия"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.from_user.id != ADMIN_ID:
+        return
+    
+    try:
+        event_id = int(query.data.split('_')[2])
+    except:
+        await query.answer("❌ Ошибка: неверный ID мероприятия", show_alert=True)
+        return
+    
+    event = get_event_details(event_id)
+    if not event:
+        await query.answer("❌ Мероприятие не найдено", show_alert=True)
+        return
+    
+    title = event[0]
+    
+    # Переключаем активность
+    is_now_active = toggle_event_active_status(event_id)
+    if is_now_active:
+        message = f"✅ Мероприятие '{title}' активировано."
+    else:
+        message = f"❌ Мероприятие '{title}' деактивировано."
     
     await query.answer(message, show_alert=True)
     
@@ -2208,6 +2280,7 @@ def main():
     # ОТДЕЛЬНЫЕ обработчики для управления мероприятиями
     application.add_handler(CallbackQueryHandler(manage_event, pattern='^manage_'))
     application.add_handler(CallbackQueryHandler(toggle_registration_handler, pattern='^toggle_reg_'))
+    application.add_handler(CallbackQueryHandler(toggle_active_handler, pattern='^toggle_active_'))
     application.add_handler(CallbackQueryHandler(download_event_handler, pattern='^download_event_'))
     application.add_handler(CallbackQueryHandler(delete_event_handler, pattern='^delete_'))
     application.add_handler(CallbackQueryHandler(confirm_delete_handler, pattern='^confirm_delete_'))
