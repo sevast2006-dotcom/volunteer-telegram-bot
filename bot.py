@@ -1,31 +1,82 @@
+import os
 import sqlite3
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
-# --- Настройки ---
-TOKEN = "YOUR_BOT_TOKEN_HERE"
+# Загружаем токен из переменных окружения (для Railway)
+TOKEN = os.environ.get('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')  # Исправлено!
+if TOKEN == 'YOUR_BOT_TOKEN_HERE':
+    raise ValueError("Токен бота не найден! Установите переменную окружения BOT_TOKEN")
+
 DB_NAME = "volunteer_bot.db"
 
 # --- Работа с базой данных ---
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-    # Создаем таблицы (код SQL из раздела выше)
+    
+    # ПОЛНЫЕ SQL запросы (исправлено!)
     cur.executescript('''
-        CREATE TABLE IF NOT EXISTS events (...);
-        CREATE TABLE IF NOT EXISTS users (...);
-        CREATE TABLE IF NOT EXISTS registrations (...);
+        -- Таблица мероприятий
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT,
+            date TEXT NOT NULL,
+            time TEXT NOT NULL,
+            location TEXT,
+            max_volunteers INTEGER,
+            is_active BOOLEAN DEFAULT 1
+        );
+        
+        -- Таблица пользователей (студентов)
+        CREATE TABLE IF NOT EXISTS users (
+            telegram_id INTEGER PRIMARY KEY,
+            full_name TEXT NOT NULL,
+            group_name TEXT,
+            phone_number TEXT
+        );
+        
+        -- Таблица записей (связь пользователь -> мероприятие)
+        CREATE TABLE IF NOT EXISTS registrations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            event_id INTEGER NOT NULL,
+            registration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            attended BOOLEAN DEFAULT 0,
+            FOREIGN KEY (user_id) REFERENCES users (telegram_id),
+            FOREIGN KEY (event_id) REFERENCES events (id),
+            UNIQUE(user_id, event_id)
+        );
     ''')
+    
+    # Добавим тестовое мероприятие, если таблица пуста
+    cur.execute("SELECT COUNT(*) FROM events")
+    if cur.fetchone()[0] == 0:
+        cur.execute('''
+            INSERT INTO events (title, description, date, time, location, max_volunteers, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            "Уборка территории",
+            "Общеуниверситетский субботник",
+            "2024-03-20",
+            "10:00",
+            "Главный корпус",
+            50,
+            1
+        ))
+    
     conn.commit()
     conn.close()
+    print("✅ База данных инициализирована")
 
 def get_active_events():
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute('''
-        SELECT id, title, date, time, location, max_volunteers,
-               (max_volunteers - COUNT(registrations.id)) as available_spots
+        SELECT events.id, events.title, events.date, events.time, events.location, events.max_volunteers,
+               (events.max_volunteers - COUNT(registrations.id)) as available_spots
         FROM events
         LEFT JOIN registrations ON events.id = registrations.event_id
         WHERE events.is_active = 1
@@ -73,7 +124,7 @@ async def list_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
     for event in events:
         event_id, title, date, time, location, max_vol, available = event
-        button_text = f"{title} ({date} {time}) - мест: {available}"
+        button_text = f"{title} ({date} {time}) - мест: {available if available else '∞'}"
         keyboard.append([InlineKeyboardButton(button_text, callback_data=f'event_{event_id}')])
 
     keyboard.append([InlineKeyboardButton("« Назад", callback_data='back_to_main')])
@@ -161,6 +212,69 @@ async def register_for_event(update: Update, context: ContextTypes.DEFAULT_TYPE)
     query.data = f'event_{event_id}'
     await event_detail(update, context)
 
+async def cancel_registration(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    
+    # Получаем активные записи пользователя
+    cur.execute('''
+        SELECT registrations.id, events.title, events.date, events.time
+        FROM registrations
+        JOIN events ON registrations.event_id = events.id
+        WHERE registrations.user_id = ? AND events.date >= date('now')
+        ORDER BY events.date
+    ''', (user_id,))
+    registrations = cur.fetchall()
+    
+    if not registrations:
+        await query.edit_message_text("У вас нет активных записей для отмены.")
+        conn.close()
+        return
+    
+    keyboard = []
+    for reg_id, title, date, time in registrations:
+        button_text = f"{title} ({date} {time})"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f'cancel_{reg_id}')])
+    
+    keyboard.append([InlineKeyboardButton("« Назад", callback_data='back_to_main')])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text("Выберите запись для отмены:", reply_markup=reply_markup)
+    conn.close()
+
+async def unregister_for_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data.startswith('cancel_'):
+        reg_id = int(query.data.split('_')[1])
+    elif query.data.startswith('unregister_'):
+        event_id = int(query.data.split('_')[1])
+        user_id = query.from_user.id
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute('SELECT id FROM registrations WHERE user_id = ? AND event_id = ?', (user_id, event_id))
+        result = cur.fetchone()
+        reg_id = result[0] if result else None
+        conn.close()
+    
+    if not reg_id:
+        await query.answer("Запись не найдена!", show_alert=True)
+        return
+    
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute('DELETE FROM registrations WHERE id = ?', (reg_id,))
+    conn.commit()
+    conn.close()
+    
+    await query.answer("Запись отменена! ❌", show_alert=True)
+    await query.edit_message_text("Ваша запись успешно отменена.")
+
 async def my_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -184,7 +298,7 @@ async def my_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = "📋 *Ваши записи:*\n\n"
         for event in events:
             event_id, title, date, time = event
-            text += f"• {title}\n  {date} в {time}\n  /event_{event_id}\n\n"
+            text += f"• {title}\n  {date} в {time}\n"
 
     keyboard = [[InlineKeyboardButton("« Назад", callback_data='back_to_main')]]
     await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
@@ -210,6 +324,9 @@ def main():
     # Инициализируем базу данных
     init_db()
     
+    print("🚀 Бот запускается...")
+    print(f"Токен: {'Установлен' if TOKEN != 'YOUR_BOT_TOKEN_HERE' else 'НЕ НАЙДЕН!'}")
+    
     # Создаем приложение
     application = Application.builder().token(TOKEN).build()
     
@@ -218,8 +335,14 @@ def main():
     application.add_handler(CallbackQueryHandler(list_events, pattern='^list_events$'))
     application.add_handler(CallbackQueryHandler(event_detail, pattern='^event_'))
     application.add_handler(CallbackQueryHandler(register_for_event, pattern='^register_'))
+    application.add_handler(CallbackQueryHandler(cancel_registration, pattern='^cancel_registration$'))
+    application.add_handler(CallbackQueryHandler(unregister_for_event, pattern='^cancel_'))
+    application.add_handler(CallbackQueryHandler(unregister_for_event, pattern='^unregister_'))
     application.add_handler(CallbackQueryHandler(my_events, pattern='^my_events$'))
     application.add_handler(CallbackQueryHandler(back_to_main, pattern='^back_to_main$'))
+    
+    print("✅ Обработчики зарегистрированы")
+    print("🤖 Бот запущен и ожидает сообщений...")
     
     # Запускаем бота
     application.run_polling()
