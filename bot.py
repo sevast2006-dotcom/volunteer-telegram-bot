@@ -1389,8 +1389,9 @@ async def manage_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
 
-async def handle_event_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает действия с мероприятиями"""
+# ========== ОТДЕЛЬНЫЕ ОБРАБОТЧИКИ ДЛЯ КНОПОК ==========
+async def toggle_registration_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает кнопку открытия/закрытия записи"""
     query = update.callback_query
     await query.answer()
     
@@ -1398,182 +1399,253 @@ async def handle_event_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     try:
-        # Разбираем callback_data
-        data_parts = query.data.split('_')
-        
-        if len(data_parts) < 2:
-            # Просто обновляем страницу
-            await manage_event(update, context)
-            return
-        
-        action = data_parts[0]
-        event_id = int(data_parts[1])
+        event_id = int(query.data.split('_')[2])
     except:
-        # Если ошибка, просто возвращаемся к управлению
-        await admin_manage_events(update, context)
+        await query.answer("❌ Ошибка: неверный ID мероприятия", show_alert=True)
         return
     
     event = get_event_details(event_id)
     if not event:
-        # Если мероприятие не найдено, возвращаемся к списку
-        await admin_manage_events(update, context)
+        await query.answer("❌ Мероприятие не найдено", show_alert=True)
         return
     
     title = event[0]
     
-    if action == 'toggle' and data_parts[1] == 'reg':
-        # Переключаем запись
-        is_now_open = toggle_event_registration(event_id)
-        if is_now_open:
-            message = f"📝 Запись на мероприятие '{title}' открыта."
-        else:
-            message = f"🔒 Запись на мероприятие '{title}' закрыта."
-        
+    # Переключаем запись
+    is_now_open = toggle_event_registration(event_id)
+    if is_now_open:
+        message = f"📝 Запись на мероприятие '{title}' открыта."
+    else:
+        message = f"🔒 Запись на мероприятие '{title}' закрыта."
+    
+    await query.answer(message, show_alert=True)
+    
+    # Обновляем страницу
+    await asyncio.sleep(0.5)
+    await manage_event(update, context)
+
+async def download_event_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает кнопку скачивания таблицы мероприятия"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.from_user.id != ADMIN_ID:
+        return
+    
+    try:
+        event_id = int(query.data.split('_')[2])
+    except:
+        await query.answer("❌ Ошибка: неверный ID мероприятия", show_alert=True)
+        return
+    
+    event = get_event_details(event_id)
+    if not event:
+        await query.answer("❌ Мероприятие не найдено", show_alert=True)
+        return
+    
+    title = event[0]
+    
+    # Создаем CSV файл для мероприятия
+    event_file = get_event_csv(event_id)
+    
+    if event_file:
+        try:
+            with open(event_file, 'rb') as f:
+                await context.bot.send_document(
+                    chat_id=query.from_user.id,
+                    document=f,
+                    filename=f'мероприятие_{event_id}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv',
+                    caption=f"📊 Таблица участников мероприятия: {title}"
+                )
+            
+            # Удаляем временный файл
+            os.remove(event_file)
+            
+            await query.answer("✅ Таблица отправлена вам в личные сообщения!", show_alert=True)
+            
+        except Exception as e:
+            print(f"❌ Ошибка при отправке CSV: {e}")
+            await query.answer("❌ Ошибка при отправке файла", show_alert=True)
+    else:
+        await query.answer("❌ Ошибка при создании файла", show_alert=True)
+
+async def delete_event_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает кнопку удаления мероприятия"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.from_user.id != ADMIN_ID:
+        return
+    
+    try:
+        event_id = int(query.data.split('_')[1])
+    except:
+        await query.answer("❌ Ошибка: неверный ID мероприятия", show_alert=True)
+        return
+    
+    event = get_event_details(event_id)
+    if not event:
+        await query.answer("❌ Мероприятие не найдено", show_alert=True)
+        return
+    
+    title = event[0]
+    
+    # Подтверждение удаления
+    keyboard = [
+        [InlineKeyboardButton("✅ Да, удалить", callback_data=f'confirm_delete_{event_id}')],
+        [InlineKeyboardButton("❌ Нет, отменить", callback_data=f'manage_{event_id}')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        f"⚠️ *Вы уверены, что хотите удалить мероприятие?*\n\n"
+        f"🎯 *Название:* {title}\n\n"
+        f"Это действие удалит:\n"
+        f"• Само мероприятие\n"
+        f"• Все записи на него\n"
+        f"• Все данные из таблицы CSV\n\n"
+        f"*Действие необратимо!*",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+async def confirm_delete_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает подтверждение удаления мероприятия"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.from_user.id != ADMIN_ID:
+        return
+    
+    try:
+        event_id = int(query.data.split('_')[2])
+    except:
+        await query.answer("❌ Ошибка: неверный ID мероприятия", show_alert=True)
+        return
+    
+    event = get_event_details(event_id)
+    if not event:
+        await query.answer("❌ Мероприятие не найдено", show_alert=True)
+        return
+    
+    title = event[0]
+    
+    # Удаляем мероприятие
+    if delete_event(event_id):
+        message = f"🗑️ Мероприятие '{title}' удалено."
+        # Возвращаемся к списку
+        await admin_manage_events(update, context)
+    else:
+        message = f"❌ Ошибка при удалении мероприятия."
         await query.answer(message, show_alert=True)
         await asyncio.sleep(0.5)
-        await manage_event(update, context)
+        await admin_manage_events(update, context)
+
+async def view_event_participants(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает участников мероприятия"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.from_user.id != ADMIN_ID:
         return
     
-    elif action == 'download' and data_parts[1] == 'event':
-        # Создаем CSV файл для мероприятия
-        event_file = get_event_csv(event_id)
-        
-        if event_file:
-            try:
-                with open(event_file, 'rb') as f:
-                    await context.bot.send_document(
-                        chat_id=query.from_user.id,
-                        document=f,
-                        filename=f'мероприятие_{event_id}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv',
-                        caption=f"📊 Таблица участников мероприятия: {title}"
-                    )
-                
-                # Удаляем временный файл
-                os.remove(event_file)
-                
-                # Возвращаемся к управлению
-                await asyncio.sleep(0.5)
-                await manage_event(update, context)
-                return
-                
-            except Exception as e:
-                print(f"❌ Ошибка при отправке CSV: {e}")
-                await query.answer("❌ Ошибка при создании файла", show_alert=True)
-        else:
-            await query.answer("❌ Ошибка при создании файла", show_alert=True)
-        
-        await asyncio.sleep(0.5)
-        await manage_event(update, context)
+    try:
+        event_id = int(query.data.split('_')[1])
+    except:
+        await query.answer("❌ Ошибка: неверный ID мероприятия", show_alert=True)
         return
     
-    elif action == 'delete':
-        # Подтверждение удаления
-        keyboard = [
-            [InlineKeyboardButton("✅ Да, удалить", callback_data=f'confirm_delete_{event_id}')],
-            [InlineKeyboardButton("❌ Нет, отменить", callback_data=f'manage_{event_id}')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            f"⚠️ *Вы уверены, что хотите удалить мероприятие?*\n\n"
-            f"🎯 *Название:* {title}\n\n"
-            f"Это действие удалит:\n"
-            f"• Само мероприятие\n"
-            f"• Все записи на него\n"
-            f"• Все данные из таблицы CSV\n\n"
-            f"*Действие необратимо!*",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
+    event = get_event_details(event_id)
+    if not event:
+        await query.edit_message_text("❌ Мероприятие не найдено.")
         return
     
-    elif action == 'confirm' and data_parts[1] == 'delete':
-        # Подтвержденное удаление
-        event_id = int(data_parts[2])
-        if delete_event(event_id):
-            message = f"🗑️ Мероприятие '{title}' удалено."
-            # Возвращаемся к списку
-            await admin_manage_events(update, context)
-            return
-        else:
-            message = f"❌ Ошибка при удалении мероприятия."
-            await query.answer(message, show_alert=True)
-            await asyncio.sleep(0.5)
-            await admin_manage_events(update, context)
-            return
+    title = event[0]
     
-    elif action == 'edit':
-        context.user_data['editing_event_id'] = event_id
-        context.user_data['editing_field'] = None
-        
-        keyboard = [
-            [InlineKeyboardButton("✏️ Название", callback_data=f'edit_field_title_{event_id}')],
-            [InlineKeyboardButton("📝 Описание", callback_data=f'edit_field_desc_{event_id}')],
-            [InlineKeyboardButton("📅 Дата", callback_data=f'edit_field_date_{event_id}')],
-            [InlineKeyboardButton("⏰ Время", callback_data=f'edit_field_time_{event_id}')],
-            [InlineKeyboardButton("📍 Место", callback_data=f'edit_field_location_{event_id}')],
-            [InlineKeyboardButton("👥 Макс. участников", callback_data=f'edit_field_max_{event_id}')],
-            [InlineKeyboardButton("◀️ Назад", callback_data=f'manage_{event_id}')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            f"✏️ *Редактирование мероприятия:* {title}\n\n"
-            "Выберите поле для редактирования:",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-        return
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute('''
+        SELECT registrations.id, registrations.comment, 
+               users.full_name, users.group_name, users.phone_number, users.username
+        FROM registrations
+        JOIN users ON registrations.user_id = users.telegram_id
+        WHERE registrations.event_id = ?
+        ORDER BY registrations.registration_date
+    ''', (event_id,))
+    registrations = cur.fetchall()
+    conn.close()
     
-    elif action == 'view':
-        conn = sqlite3.connect(DB_NAME)
-        cur = conn.cursor()
-        cur.execute('''
-            SELECT registrations.id, registrations.comment, 
-                   users.full_name, users.group_name, users.phone_number, users.username
-            FROM registrations
-            JOIN users ON registrations.user_id = users.telegram_id
-            WHERE registrations.event_id = ?
-            ORDER BY registrations.registration_date
-        ''', (event_id,))
-        registrations = cur.fetchall()
-        conn.close()
-        
-        if not registrations:
-            text = f"👥 *Записанные на мероприятие:* {title}\n\n"
-            text += "Пока никто не записался."
-        else:
-            text = f"👥 *Записанные на мероприятие:* {title}\n"
-            text += f"Всего записей: {len(registrations)}\n\n"
-            
-            for i, reg in enumerate(registrations, 1):
-                reg_id, comment, full_name, group_name, phone, username = reg
-                text += f"{i}. *{full_name}*\n"
-                text += f"   ID записи: {reg_id}\n"
-                if group_name:
-                    text += f"   Группа: {group_name}\n"
-                if phone:
-                    text += f"   Телефон: {phone}\n"
-                if username:
-                    text += f"   @{username.replace('@', '')}\n"
-                if comment:
-                    text += f"   💬 Комментарий: {comment}\n"
-                text += "\n"
-        
-        keyboard = [[InlineKeyboardButton("◀️ Назад к управлению", callback_data=f'manage_{event_id}')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(
-            text,
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-        return
-    
+    if not registrations:
+        text = f"👥 *Записанные на мероприятие:* {title}\n\n"
+        text += "Пока никто не записался."
     else:
-        # Неизвестное действие - просто обновляем
-        await manage_event(update, context)
+        text = f"👥 *Записанные на мероприятие:* {title}\n"
+        text += f"Всего записей: {len(registrations)}\n\n"
+        
+        for i, reg in enumerate(registrations, 1):
+            reg_id, comment, full_name, group_name, phone, username = reg
+            text += f"{i}. *{full_name}*\n"
+            text += f"   ID записи: {reg_id}\n"
+            if group_name:
+                text += f"   Группа: {group_name}\n"
+            if phone:
+                text += f"   Телефон: {phone}\n"
+            if username:
+                text += f"   @{username.replace('@', '')}\n"
+            if comment:
+                text += f"   💬 Комментарий: {comment}\n"
+            text += "\n"
+    
+    keyboard = [[InlineKeyboardButton("◀️ Назад к управлению", callback_data=f'manage_{event_id}')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+async def edit_event_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает редактирование мероприятия"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.from_user.id != ADMIN_ID:
         return
+    
+    try:
+        event_id = int(query.data.split('_')[1])
+    except:
+        await query.answer("❌ Ошибка: неверный ID мероприятия", show_alert=True)
+        return
+    
+    context.user_data['editing_event_id'] = event_id
+    context.user_data['editing_field'] = None
+    
+    event = get_event_details(event_id)
+    if not event:
+        await query.edit_message_text("❌ Мероприятие не найдено.")
+        return
+    
+    title = event[0]
+    
+    keyboard = [
+        [InlineKeyboardButton("✏️ Название", callback_data=f'edit_field_title_{event_id}')],
+        [InlineKeyboardButton("📝 Описание", callback_data=f'edit_field_desc_{event_id}')],
+        [InlineKeyboardButton("📅 Дата", callback_data=f'edit_field_date_{event_id}')],
+        [InlineKeyboardButton("⏰ Время", callback_data=f'edit_field_time_{event_id}')],
+        [InlineKeyboardButton("📍 Место", callback_data=f'edit_field_location_{event_id}')],
+        [InlineKeyboardButton("👥 Макс. участников", callback_data=f'edit_field_max_{event_id}')],
+        [InlineKeyboardButton("◀️ Назад", callback_data=f'manage_{event_id}')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        f"✏️ *Редактирование мероприятия:* {title}\n\n"
+        "Выберите поле для редактирования:",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
 
 async def edit_event_field_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начинает редактирование поля мероприятия"""
@@ -2117,7 +2189,7 @@ def main():
     application.add_handler(edit_event_handler)
     application.add_handler(register_handler)
     
-    # Регистрируем обработчики callback-запросов
+    # Регистрируем обработчики callback-запросов (ОБЫЧНЫЕ)
     application.add_handler(CallbackQueryHandler(list_events, pattern='^list_events$'))
     application.add_handler(CallbackQueryHandler(event_detail, pattern='^event_'))
     application.add_handler(CallbackQueryHandler(cancel_registration, pattern='^cancel_reg_'))
@@ -2133,9 +2205,14 @@ def main():
     application.add_handler(CallbackQueryHandler(admin_table_btn, pattern='^admin_table_btn$'))
     application.add_handler(CallbackQueryHandler(admin_back, pattern='^admin_back$'))
     
-    # Обработчики управления мероприятиями
+    # ОТДЕЛЬНЫЕ обработчики для управления мероприятиями
     application.add_handler(CallbackQueryHandler(manage_event, pattern='^manage_'))
-    application.add_handler(CallbackQueryHandler(handle_event_action, pattern='^(toggle_reg|download_event|edit|view|delete|confirm_delete)_'))
+    application.add_handler(CallbackQueryHandler(toggle_registration_handler, pattern='^toggle_reg_'))
+    application.add_handler(CallbackQueryHandler(download_event_handler, pattern='^download_event_'))
+    application.add_handler(CallbackQueryHandler(delete_event_handler, pattern='^delete_'))
+    application.add_handler(CallbackQueryHandler(confirm_delete_handler, pattern='^confirm_delete_'))
+    application.add_handler(CallbackQueryHandler(view_event_participants, pattern='^view_'))
+    application.add_handler(CallbackQueryHandler(edit_event_start, pattern='^edit_'))
     
     # Обработчик сообщений для добавления мероприятий из кнопок
     application.add_handler(MessageHandler(
