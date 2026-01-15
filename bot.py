@@ -40,8 +40,9 @@ def init_db():
             telegram_id INTEGER PRIMARY KEY,
             full_name TEXT NOT NULL,
             group_name TEXT,
+            birth_date TEXT,
             phone_number TEXT,
-            email TEXT,
+            username TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         
@@ -83,7 +84,7 @@ def init_csv():
             writer = csv.writer(f)
             writer.writerow([
                 'ID записи', 'Дата записи', 'Время записи',
-                'Telegram ID', 'ФИО', 'Группа', 'Телефон', 'Email',
+                'Telegram ID', 'ФИО', 'Группа', 'Дата рождения', 'Телефон', 'Username',
                 'ID мероприятия', 'Название мероприятия',
                 'Дата мероприятия', 'Время мероприятия', 'Место',
                 'Статус записи'
@@ -100,8 +101,9 @@ def save_to_csv(user_data, event_data):
             user_data.get('telegram_id', ''),
             user_data.get('full_name', ''),
             user_data.get('group', ''),
+            user_data.get('birth_date', ''),
             user_data.get('phone', ''),
-            user_data.get('email', ''),
+            user_data.get('username', ''),
             event_data.get('id', ''),
             event_data.get('title', ''),
             event_data.get('date', ''),
@@ -173,24 +175,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute('''
-        INSERT OR IGNORE INTO users (telegram_id, full_name) 
-        VALUES (?, ?)
-    ''', (user.id, user.full_name))
+        INSERT OR IGNORE INTO users (telegram_id, full_name, username) 
+        VALUES (?, ?, ?)
+    ''', (user.id, user.full_name, f"@{user.username}" if user.username else ""))
     conn.commit()
     conn.close()
     
     keyboard = [
         [InlineKeyboardButton("📝 Записаться на мероприятие", callback_data='list_events')],
         [InlineKeyboardButton("👤 Мои данные", callback_data='my_info')],
-        [InlineKeyboardButton("📋 Мои записи", callback_data='my_registrations')],
-        [InlineKeyboardButton("❓ Помощь", callback_data='help_info')]
+        [InlineKeyboardButton("📋 Мои записи", callback_data='my_registrations')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
         f"👋 Привет, {user.first_name}!\n\n"
         "Я бот для записи на волонтерские мероприятия.\n"
-        "Сначала проверьте свои данные, затем выбирайте мероприятия!",
+        "Сначала заполните свои данные, затем выбирайте мероприятия!",
         reply_markup=reply_markup
     )
 
@@ -202,9 +203,17 @@ async def list_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
     events = get_active_events()
     
     if not events:
+        keyboard = [
+            [InlineKeyboardButton("👤 Мои данные", callback_data='my_info')],
+            [InlineKeyboardButton("📋 Мои записи", callback_data='my_registrations')],
+            [InlineKeyboardButton("🏠 В главное меню", callback_data='main_menu')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
         await query.edit_message_text(
-            "📭 На данный момент нет активных мероприятий.\n"
+            "📭 *На данный момент нет активных мероприятий.*\n\n"
             "Загляните позже!",
+            reply_markup=reply_markup,
             parse_mode='Markdown'
         )
         return
@@ -294,7 +303,7 @@ async def event_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton("❌ Отменить запись", callback_data=f'cancel_{event_id}')])
     
     keyboard.append([InlineKeyboardButton("📅 К списку мероприятий", callback_data='list_events')])
-    keyboard.append([InlineKeyboardButton("👤 Проверить мои данные", callback_data='my_info')])
+    keyboard.append([InlineKeyboardButton("👤 Мои данные", callback_data='my_info')])
     
     await query.edit_message_text(
         text,
@@ -312,24 +321,26 @@ async def my_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Получаем данные пользователя
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-    cur.execute('SELECT full_name, group_name, phone_number, email FROM users WHERE telegram_id = ?', (user_id,))
+    cur.execute('SELECT full_name, group_name, birth_date, phone_number, username FROM users WHERE telegram_id = ?', (user_id,))
     user = cur.fetchone()
     conn.close()
     
     if not user:
         text = "❌ Ваши данные не найдены. Пожалуйста, нажмите /start"
     else:
-        full_name, group_name, phone, email = user
+        full_name, group_name, birth_date, phone, username = user
         text = "👤 *Ваши данные:*\n\n"
         text += f"• *ФИО:* {full_name if full_name else '❌ Не заполнено'}\n"
         text += f"• *Группа:* {group_name if group_name else '❌ Не заполнена'}\n"
+        text += f"• *Дата рождения:* {birth_date if birth_date else '❌ Не заполнена'}\n"
         text += f"• *Телефон:* {phone if phone else '❌ Не заполнен'}\n"
-        text += f"• *Email:* {email if email else '❌ Не заполнен'}\n\n"
+        text += f"• *Username:* {username if username else '❌ Не заполнен'}\n\n"
         
         # Проверяем, все ли данные заполнены
         missing = []
         if not full_name: missing.append("ФИО")
         if not group_name: missing.append("группа")
+        if not birth_date: missing.append("дата рождения")
         if not phone: missing.append("телефон")
         
         if missing:
@@ -359,10 +370,11 @@ async def edit_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         "✏️ *Заполните ваши данные*\n\n"
         "Отправьте сообщение в формате:\n\n"
-        "`ФИО, Группа, Телефон`\n\n"
+        "`ФИО, Группа, Дата рождения (ДД.ММ.ГГГГ), Телефон, @username`\n\n"
         "*Пример:*\n"
-        "`Иванов Иван Иванович, ИВТ-20-1, +79161234567`\n\n"
-        "📌 *Все поля обязательны для записи на мероприятия.*",
+        "`Иванов Иван Иванович, ИВТ-20-1, 15.05.2000, +79161234567, @ivanov`\n\n"
+        "📌 *Все поля обязательны для записи на мероприятия.*\n"
+        "📌 *Данные сохранятся и не нужно будет вводить их заново.*",
         parse_mode='Markdown'
     )
     
@@ -381,48 +393,75 @@ async def save_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         parts = [part.strip() for part in text.split(',')]
         
-        if len(parts) >= 3:
-            full_name = parts[0]
-            group = parts[1]
-            phone = parts[2]
-            email = parts[3] if len(parts) > 3 else ''
-            
-            # Сохраняем в БД
-            conn = sqlite3.connect(DB_NAME)
-            cur = conn.cursor()
-            cur.execute('''
-                INSERT OR REPLACE INTO users 
-                (telegram_id, full_name, group_name, phone_number, email)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (update.effective_user.id, full_name, group, phone, email))
-            conn.commit()
-            conn.close()
-            
-            await update.message.reply_text(
-                "✅ *Данные сохранены!*\n\n"
-                f"• ФИО: {full_name}\n"
-                f"• Группа: {group}\n"
-                f"• Телефон: {phone}\n"
-                f"• Email: {email if email else 'не указан'}\n\n"
-                "Теперь вы можете записываться на мероприятия!",
-                parse_mode='Markdown'
-            )
-            
-            # Показываем кнопки
-            keyboard = [
-                [InlineKeyboardButton("📝 Записаться на мероприятие", callback_data='list_events')],
-                [InlineKeyboardButton("👤 Посмотреть мои данные", callback_data='my_info')]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await update.message.reply_text("Выберите действие:", reply_markup=reply_markup)
+        if len(parts) >= 5:
+            try:
+                full_name = parts[0]
+                group = parts[1]
+                birth_date = parts[2]
+                phone = parts[3]
+                username = parts[4]
+                
+                # Проверяем формат даты рождения
+                try:
+                    datetime.strptime(birth_date, '%d.%m.%Y')
+                except ValueError:
+                    await update.message.reply_text(
+                        "❌ Неверный формат даты рождения! Используйте ДД.ММ.ГГГГ\n"
+                        "Пример: 15.05.2000"
+                    )
+                    return
+                
+                # Проверяем username
+                if not username.startswith('@'):
+                    await update.message.reply_text(
+                        "❌ Username должен начинаться с @\n"
+                        "Пример: @ivanov"
+                    )
+                    return
+                
+                # Сохраняем в БД
+                conn = sqlite3.connect(DB_NAME)
+                cur = conn.cursor()
+                cur.execute('''
+                    INSERT OR REPLACE INTO users 
+                    (telegram_id, full_name, group_name, birth_date, phone_number, username)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (update.effective_user.id, full_name, group, birth_date, phone, username))
+                conn.commit()
+                conn.close()
+                
+                await update.message.reply_text(
+                    "✅ *Данные сохранены!*\n\n"
+                    f"• ФИО: {full_name}\n"
+                    f"• Группа: {group}\n"
+                    f"• Дата рождения: {birth_date}\n"
+                    f"• Телефон: {phone}\n"
+                    f"• Username: {username}\n\n"
+                    "📌 *Данные сохранены. Теперь вы можете записываться на мероприятия!*",
+                    parse_mode='Markdown'
+                )
+                
+                # Показываем кнопки
+                keyboard = [
+                    [InlineKeyboardButton("📝 Записаться на мероприятие", callback_data='list_events')],
+                    [InlineKeyboardButton("👤 Посмотреть мои данные", callback_data='my_info')]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await update.message.reply_text("Выберите действие:", reply_markup=reply_markup)
+                
+            except Exception as e:
+                await update.message.reply_text(
+                    f"❌ Ошибка при сохранении: {e}\n\n"
+                    "Пожалуйста, проверьте правильность ввода данных."
+                )
         else:
             await update.message.reply_text(
                 "❌ *Неверный формат!*\n\n"
                 "Пожалуйста, отправьте данные в формате:\n"
-                "`ФИО, Группа, Телефон`\n\n"
+                "`ФИО, Группа, Дата рождения, Телефон, @username`\n\n"
                 "Пример:\n"
-                "`Иванов Иван Иванович, ИВТ-20-1, +79161234567`",
+                "`Иванов Иван Иванович, ИВТ-20-1, 15.05.2000, +79161234567, @ivanov`",
                 parse_mode='Markdown'
             )
         
@@ -444,7 +483,7 @@ async def register_for_event(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # 1. Проверяем данные пользователя
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-    cur.execute('SELECT full_name, group_name, phone_number FROM users WHERE telegram_id = ?', (user_id,))
+    cur.execute('SELECT full_name, group_name, birth_date, phone_number, username FROM users WHERE telegram_id = ?', (user_id,))
     user = cur.fetchone()
     
     if not user:
@@ -452,15 +491,16 @@ async def register_for_event(update: Update, context: ContextTypes.DEFAULT_TYPE)
         conn.close()
         return
     
-    full_name, group, phone = user
+    full_name, group, birth_date, phone, username = user
     
     # Проверяем обязательные поля
-    if not full_name or not group or not phone:
-        missing = []
-        if not full_name: missing.append("ФИО")
-        if not group: missing.append("группа")
-        if not phone: missing.append("телефон")
-        
+    missing = []
+    if not full_name: missing.append("ФИО")
+    if not group: missing.append("группа")
+    if not birth_date: missing.append("дата рождения")
+    if not phone: missing.append("телефон")
+    
+    if missing:
         keyboard = [
             [InlineKeyboardButton("✏️ Заполнить данные", callback_data='edit_info')],
             [InlineKeyboardButton("📅 К мероприятиям", callback_data='list_events')]
@@ -513,8 +553,9 @@ async def register_for_event(update: Update, context: ContextTypes.DEFAULT_TYPE)
         'telegram_id': user_id,
         'full_name': full_name,
         'group': group,
+        'birth_date': birth_date,
         'phone': phone,
-        'email': ''
+        'username': username
     }
     
     event_data = {
@@ -636,35 +677,6 @@ async def cancel_registration(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         await query.answer("❌ Запись не найдена", show_alert=True)
 
-async def help_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает справку"""
-    query = update.callback_query
-    await query.answer()
-    
-    text = (
-        "❓ *Помощь по использованию бота*\n\n"
-        "1. *Заполните данные* — перед записью укажите ФИО, группу и телефон\n"
-        "2. *Выберите мероприятие* — из списка доступных\n"
-        "3. *Запишитесь* — данные автоматически сохранятся в таблицу\n\n"
-        "📌 *Для организаторов:*\n"
-        "Все записи сохраняются в CSV файл.\n"
-        "Для получения таблицы используйте команду /table (только для админов).\n\n"
-        "🔄 *Проблемы с записью?*\n"
-        "Напишите организаторам или попробуйте позже."
-    )
-    
-    keyboard = [
-        [InlineKeyboardButton("👤 Мои данные", callback_data='my_info')],
-        [InlineKeyboardButton("📝 Записаться", callback_data='list_events')],
-        [InlineKeyboardButton("🏠 В главное меню", callback_data='main_menu')]
-    ]
-    
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
-    )
-
 async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Главное меню"""
     query = update.callback_query
@@ -673,8 +685,7 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("📝 Записаться на мероприятие", callback_data='list_events')],
         [InlineKeyboardButton("👤 Мои данные", callback_data='my_info')],
-        [InlineKeyboardButton("📋 Мои записи", callback_data='my_registrations')],
-        [InlineKeyboardButton("❓ Помощь", callback_data='help_info')]
+        [InlineKeyboardButton("📋 Мои записи", callback_data='my_registrations')]
     ]
     
     await query.edit_message_text(
@@ -910,6 +921,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='Markdown')
 
+# ========== ИСПРАВЛЕННЫЕ ФУНКЦИИ КНОПОК ==========
 async def admin_add_event_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопки добавления мероприятия"""
     query = update.callback_query
@@ -918,7 +930,9 @@ async def admin_add_event_btn(update: Update, context: ContextTypes.DEFAULT_TYPE
     if query.from_user.id != ADMIN_ID:
         return
     
-    await admin_add_event(Update(message=query.message), context)
+    # Исправленный вызов
+    update_obj = Update(update_id=update.update_id, message=query.message)
+    await admin_add_event(update_obj, context)
 
 async def admin_list_events_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопки списка мероприятий"""
@@ -928,7 +942,8 @@ async def admin_list_events_btn(update: Update, context: ContextTypes.DEFAULT_TY
     if query.from_user.id != ADMIN_ID:
         return
     
-    await admin_list_events(Update(message=query.message), context)
+    update_obj = Update(update_id=update.update_id, message=query.message)
+    await admin_list_events(update_obj, context)
 
 async def admin_stats_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопки статистики"""
@@ -938,7 +953,8 @@ async def admin_stats_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.from_user.id != ADMIN_ID:
         return
     
-    await admin_stats(Update(message=query.message), context)
+    update_obj = Update(update_id=update.update_id, message=query.message)
+    await admin_stats(update_obj, context)
 
 async def admin_download_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопки скачивания таблицы"""
@@ -948,7 +964,28 @@ async def admin_download_btn(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if query.from_user.id != ADMIN_ID:
         return
     
-    await admin_table(Update(message=query.message), context)
+    update_obj = Update(update_id=update.update_id, message=query.message)
+    await admin_table(update_obj, context)
+
+# ========== ОБРАБОТЧИК ОШИБОК ==========
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик ошибок"""
+    try:
+        raise context.error
+    except Exception as e:
+        print(f"⚠️ Ошибка: {e}")
+        
+        # Отправляем сообщение админу об ошибке
+        if ADMIN_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=f"⚠️ Ошибка в боте: {type(e).__name__}: {e}"
+                )
+            except:
+                pass
+    
+    return
 
 # ========== ОСНОВНАЯ ФУНКЦИЯ ==========
 def main():
@@ -965,6 +1002,9 @@ def main():
     
     # Создаем приложение
     application = Application.builder().token(TOKEN).build()
+    
+    # Добавляем обработчик ошибок
+    application.add_error_handler(error_handler)
     
     # Регистрируем обработчики команд
     application.add_handler(CommandHandler("start", start))
@@ -983,7 +1023,6 @@ def main():
     application.add_handler(CallbackQueryHandler(my_info, pattern='^my_info$'))
     application.add_handler(CallbackQueryHandler(edit_info, pattern='^edit_info$'))
     application.add_handler(CallbackQueryHandler(my_registrations, pattern='^my_registrations$'))
-    application.add_handler(CallbackQueryHandler(help_info, pattern='^help_info$'))
     application.add_handler(CallbackQueryHandler(main_menu, pattern='^main_menu$'))
     
     # Админ обработчики кнопок
@@ -999,8 +1038,11 @@ def main():
     print("✅ Бот запущен и ожидает сообщений...")
     print("=" * 50)
     
-    # Запускаем бота
-    application.run_polling()
+    # Запускаем бота с параметрами для Railway
+    application.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES
+    )
 
 if __name__ == "__main__":
     main()
