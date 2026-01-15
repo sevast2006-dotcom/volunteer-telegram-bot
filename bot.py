@@ -5,43 +5,7 @@ import csv
 import time
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
-
-# ========== ПРОВЕРКА НА ОДИН ЭКЗЕМПЛЯР ==========
-def check_single_instance():
-    """Проверяет, что запущен только один экземпляр бота"""
-    lock_file = '/tmp/bot.lock'
-    
-    # Проверяем существование lock файла
-    if os.path.exists(lock_file):
-        try:
-            # Читаем PID из файла
-            with open(lock_file, 'r') as f:
-                old_pid = int(f.read().strip())
-            
-            # Проверяем, жив ли процесс
-            try:
-                os.kill(old_pid, 0)  # Процесс существует
-                print(f"❌ Бот уже запущен с PID {old_pid}. Останавливаем...")
-                return False
-            except OSError:
-                # Процесс умер, удаляем старый lock файл
-                os.remove(lock_file)
-                print(f"⚠️ Удален старый lock файл от умершего процесса {old_pid}")
-        except:
-            # Ошибка чтения файла, удаляем его
-            if os.path.exists(lock_file):
-                os.remove(lock_file)
-    
-    # Создаем новый lock файл
-    with open(lock_file, 'w') as f:
-        f.write(str(os.getpid()))
-    
-    # Удаляем lock файл при выходе
-    import atexit
-    atexit.register(lambda: os.remove(lock_file) if os.path.exists(lock_file) else None)
-    
-    return True
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
 # ========== НАСТРОЙКИ ==========
 TOKEN = os.environ.get('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
@@ -52,6 +16,9 @@ if TOKEN == 'YOUR_BOT_TOKEN_HERE':
 
 DB_NAME = "volunteer_bot.db"
 CSV_FILE = "volunteers.csv"
+
+# Состояния для ConversationHandler
+EDITING_INFO, ADDING_EVENT = range(2)
 
 print(f"🚀 Бот запускается...")
 print(f"👑 Админ ID: {ADMIN_ID}")
@@ -400,8 +367,8 @@ async def my_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
 
-async def edit_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запрашивает данные пользователя"""
+async def edit_info_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает процесс редактирования данных"""
     query = update.callback_query
     await query.answer()
     
@@ -412,98 +379,102 @@ async def edit_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Пример:*\n"
         "`Иванов Иван Иванович, ИВТ-20-1, 15.05.2000, +79161234567, @ivanov`\n\n"
         "📌 *Все поля обязательны для записи на мероприятия.*\n"
-        "📌 *Данные сохранятся и не нужно будет вводить их заново.*",
+        "📌 *Данные сохранятся и не нужно будет вводить их заново.*\n\n"
+        "Для отмены отправьте /cancel",
         parse_mode='Markdown'
     )
     
-    context.user_data['awaiting_info'] = True
+    return EDITING_INFO
 
 async def save_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сохраняет данные пользователя"""
-    if context.user_data.get('awaiting_info'):
-        text = update.message.text.strip()
-        
-        # Проверяем отмену
-        if text.lower() == '/cancel':
-            context.user_data['awaiting_info'] = False
-            await update.message.reply_text("✅ Заполнение данных отменено.")
-            return
-        
-        parts = [part.strip() for part in text.split(',')]
-        
-        if len(parts) >= 5:
+    text = update.message.text.strip()
+    
+    # Проверяем отмену
+    if text.lower() == '/cancel':
+        await update.message.reply_text("✅ Заполнение данных отменено.")
+        return ConversationHandler.END
+    
+    parts = [part.strip() for part in text.split(',')]
+    
+    if len(parts) >= 5:
+        try:
+            full_name = parts[0]
+            group = parts[1]
+            birth_date = parts[2]
+            phone = parts[3]
+            username = parts[4]
+            
+            # Проверяем формат даты рождения
             try:
-                full_name = parts[0]
-                group = parts[1]
-                birth_date = parts[2]
-                phone = parts[3]
-                username = parts[4]
-                
-                # Проверяем формат даты рождения
-                try:
-                    datetime.strptime(birth_date, '%d.%m.%Y')
-                except ValueError:
-                    await update.message.reply_text(
-                        "❌ Неверный формат даты рождения! Используйте ДД.ММ.ГГГГ\n"
-                        "Пример: 15.05.2000"
-                    )
-                    return
-                
-                # Проверяем username
-                if not username.startswith('@'):
-                    await update.message.reply_text(
-                        "❌ Username должен начинаться с @\n"
-                        "Пример: @ivanov"
-                    )
-                    return
-                
-                # Сохраняем в БД
-                conn = sqlite3.connect(DB_NAME)
-                cur = conn.cursor()
-                cur.execute('''
-                    INSERT OR REPLACE INTO users 
-                    (telegram_id, full_name, group_name, birth_date, phone_number, username)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (update.effective_user.id, full_name, group, birth_date, phone, username))
-                conn.commit()
-                conn.close()
-                
+                datetime.strptime(birth_date, '%d.%m.%Y')
+            except ValueError:
                 await update.message.reply_text(
-                    "✅ *Данные сохранены!*\n\n"
-                    f"• ФИО: {full_name}\n"
-                    f"• Группа: {group}\n"
-                    f"• Дата рождения: {birth_date}\n"
-                    f"• Телефон: {phone}\n"
-                    f"• Username: {username}\n\n"
-                    "📌 *Данные сохранены. Теперь вы можете записываться на мероприятия!*",
-                    parse_mode='Markdown'
+                    "❌ Неверный формат даты рождения! Используйте ДД.ММ.ГГГГ\n"
+                    "Пример: 15.05.2000\n\n"
+                    "Попробуйте еще раз или отправьте /cancel для отмены"
                 )
-                
-                # Показываем кнопки
-                keyboard = [
-                    [InlineKeyboardButton("📝 Записаться на мероприятие", callback_data='list_events')],
-                    [InlineKeyboardButton("👤 Посмотреть мои данные", callback_data='my_info')]
-                ]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await update.message.reply_text("Выберите действие:", reply_markup=reply_markup)
-                
-            except Exception as e:
+                return EDITING_INFO
+            
+            # Проверяем username
+            if not username.startswith('@'):
                 await update.message.reply_text(
-                    f"❌ Ошибка при сохранении: {e}\n\n"
-                    "Пожалуйста, проверьте правильность ввода данных."
+                    "❌ Username должен начинаться с @\n"
+                    "Пример: @ivanov\n\n"
+                    "Попробуйте еще раз или отправьте /cancel для отмены"
                 )
-        else:
+                return EDITING_INFO
+            
+            # Сохраняем в БД
+            conn = sqlite3.connect(DB_NAME)
+            cur = conn.cursor()
+            cur.execute('''
+                INSERT OR REPLACE INTO users 
+                (telegram_id, full_name, group_name, birth_date, phone_number, username)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (update.effective_user.id, full_name, group, birth_date, phone, username))
+            conn.commit()
+            conn.close()
+            
             await update.message.reply_text(
-                "❌ *Неверный формат!*\n\n"
-                "Пожалуйста, отправьте данные в формате:\n"
-                "`ФИО, Группа, Дата рождения, Телефон, @username`\n\n"
-                "Пример:\n"
-                "`Иванов Иван Иванович, ИВТ-20-1, 15.05.2000, +79161234567, @ivanov`",
+                "✅ *Данные сохранены!*\n\n"
+                f"• ФИО: {full_name}\n"
+                f"• Группа: {group}\n"
+                f"• Дата рождения: {birth_date}\n"
+                f"• Телефон: {phone}\n"
+                f"• Username: {username}\n\n"
+                "📌 *Данные сохранены. Теперь вы можете записываться на мероприятия!*",
                 parse_mode='Markdown'
             )
-        
-        context.user_data['awaiting_info'] = False
+            
+            # Показываем кнопки
+            keyboard = [
+                [InlineKeyboardButton("📝 Записаться на мероприятие", callback_data='list_events')],
+                [InlineKeyboardButton("👤 Посмотреть мои данные", callback_data='my_info')]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text("Выберите действие:", reply_markup=reply_markup)
+            
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ Ошибка при сохранении: {e}\n\n"
+                "Пожалуйста, проверьте правильность ввода данных."
+            )
+            return EDITING_INFO
+    else:
+        await update.message.reply_text(
+            "❌ *Неверный формат!*\n\n"
+            "Пожалуйста, отправьте данные в формате:\n"
+            "`ФИО, Группа, Дата рождения, Телефон, @username`\n\n"
+            "Пример:\n"
+            "`Иванов Иван Иванович, ИВТ-20-1, 15.05.2000, +79161234567, @ivanov`\n\n"
+            "Попробуйте еще раз или отправьте /cancel для отмены",
+            parse_mode='Markdown'
+        )
+        return EDITING_INFO
+    
+    return ConversationHandler.END
 
 async def register_for_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Записывает пользователя на мероприятие"""
@@ -737,93 +708,116 @@ async def admin_add_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начало процесса добавления мероприятия"""
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ У вас нет прав доступа.")
-        return
+        return ConversationHandler.END
     
     await update.message.reply_text(
         "📝 *Добавление нового мероприятия*\n\n"
         "Отправьте данные в формате:\n\n"
-        "`Название, Дата (ГГГГ-ММ-ДД), Время (ЧЧ:ММ), Место, Макс. участников`\n\n"
+        "`Название, Описание, Дата (ГГГГ-ММ-ДД), Время (ЧЧ:ММ), Место, Макс. участников`\n\n"
         "*Пример:*\n"
-        "`Уборка парка, 2024-04-10, 14:00, Центральный парк, 30`\n\n"
+        "`Уборка парка, Субботник в центральном парке, 2024-04-10, 14:00, Центральный парк, 30`\n\n"
         "📌 *Примечания:*\n"
         "- Дата в формате ГГГГ-ММ-ДД\n"
         "- Время в формате ЧЧ:ММ\n"
         "- Макс. участников: число или 0 для неограниченного\n"
-        "- Для отмены отправьте /cancel",
+        "- Описание не обязательно\n\n"
+        "Для отмены отправьте /cancel",
         parse_mode='Markdown'
     )
     
-    context.user_data['adding_event'] = True
+    return ADDING_EVENT
 
 async def save_new_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сохраняет новое мероприятие из сообщения"""
-    if context.user_data.get('adding_event'):
-        text = update.message.text.strip()
-        
-        if text.lower() == '/cancel':
-            context.user_data['adding_event'] = False
-            await update.message.reply_text("❌ Добавление мероприятия отменено.")
-            return
-        
-        parts = [part.strip() for part in text.split(',')]
-        
-        if len(parts) >= 5:
+    text = update.message.text.strip()
+    
+    if text.lower() == '/cancel':
+        await update.message.reply_text("❌ Добавление мероприятия отменено.")
+        return ConversationHandler.END
+    
+    parts = [part.strip() for part in text.split(',')]
+    
+    if len(parts) >= 5:
+        try:
+            title = parts[0]
+            description = parts[1] if len(parts) > 5 else ""
+            date = parts[-4] if len(parts) > 5 else parts[1]
+            time = parts[-3] if len(parts) > 5 else parts[2]
+            location = parts[-2] if len(parts) > 5 else parts[3]
+            max_volunteers = int(parts[-1]) if parts[-1].isdigit() else 0
+            
+            # Проверяем формат даты
             try:
-                title = parts[0]
-                date = parts[1]
-                time = parts[2]
-                location = parts[3]
-                max_volunteers = int(parts[4]) if parts[4].isdigit() else 0
-                description = parts[5] if len(parts) > 5 else ""
-                
-                # Проверяем формат даты
-                try:
-                    datetime.strptime(date, '%Y-%m-%d')
-                except ValueError:
-                    await update.message.reply_text("❌ Неверный формат даты! Используйте ГГГГ-ММ-ДД")
-                    return
-                
-                # Проверяем формат времени
-                try:
-                    datetime.strptime(time, '%H:%M')
-                except ValueError:
-                    await update.message.reply_text("❌ Неверный формат времени! Используйте ЧЧ:ММ")
-                    return
-                
-                # Сохраняем в БД
-                conn = sqlite3.connect(DB_NAME)
-                cur = conn.cursor()
-                cur.execute('''
-                    INSERT INTO events (title, description, date, time, location, max_volunteers, is_active)
-                    VALUES (?, ?, ?, ?, ?, ?, 1)
-                ''', (title, description, date, time, location, max_volunteers))
-                event_id = cur.lastrowid
-                conn.commit()
-                conn.close()
-                
-                # Формируем ответ
-                text = (
-                    "✅ *Мероприятие добавлено!*\n\n"
-                    f"🎯 *Название:* {title}\n"
-                    f"📅 *Дата:* {date}\n"
-                    f"⏰ *Время:* {time}\n"
-                    f"📍 *Место:* {location}\n"
-                    f"👥 *Макс. участников:* {max_volunteers if max_volunteers > 0 else 'не ограничено'}\n"
+                datetime.strptime(date, '%Y-%m-%d')
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ Неверный формат даты! Используйте ГГГГ-ММ-ДД\n"
+                    "Пример: 2024-04-10\n\n"
+                    "Попробуйте еще раз или отправьте /cancel для отмены"
                 )
-                
-                if description:
-                    text += f"📝 *Описание:* {description}\n"
-                
-                text += f"\n🆔 *ID мероприятия:* {event_id}"
-                
-                await update.message.reply_text(text, parse_mode='Markdown')
-                
-                print(f"✅ Добавлено мероприятие: {title} (ID: {event_id})")
-                
-            except Exception as e:
-                await update.message.reply_text(f"❌ Ошибка: {e}")
-        
-        context.user_data['adding_event'] = False
+                return ADDING_EVENT
+            
+            # Проверяем формат времени
+            try:
+                datetime.strptime(time, '%H:%M')
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ Неверный формат времени! Используйте ЧЧ:ММ\n"
+                    "Пример: 14:00\n\n"
+                    "Попробуйте еще раз или отправьте /cancel для отмены"
+                )
+                return ADDING_EVENT
+            
+            # Сохраняем в БД
+            conn = sqlite3.connect(DB_NAME)
+            cur = conn.cursor()
+            cur.execute('''
+                INSERT INTO events (title, description, date, time, location, max_volunteers, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, 1)
+            ''', (title, description, date, time, location, max_volunteers))
+            event_id = cur.lastrowid
+            conn.commit()
+            conn.close()
+            
+            # Формируем ответ
+            text = (
+                "✅ *Мероприятие добавлено!*\n\n"
+                f"🎯 *Название:* {title}\n"
+                f"📅 *Дата:* {date}\n"
+                f"⏰ *Время:* {time}\n"
+                f"📍 *Место:* {location}\n"
+                f"👥 *Макс. участников:* {max_volunteers if max_volunteers > 0 else 'не ограничено'}\n"
+            )
+            
+            if description:
+                text += f"📝 *Описание:* {description}\n"
+            
+            text += f"\n🆔 *ID мероприятия:* {event_id}"
+            
+            await update.message.reply_text(text, parse_mode='Markdown')
+            
+            print(f"✅ Добавлено мероприятие: {title} (ID: {event_id})")
+            
+        except Exception as e:
+            await update.message.reply_text(
+                f"❌ Ошибка: {e}\n\n"
+                "Проверьте правильность ввода данных и попробуйте еще раз.\n"
+                "Для отмены отправьте /cancel"
+            )
+            return ADDING_EVENT
+    else:
+        await update.message.reply_text(
+            "❌ *Неверный формат!*\n\n"
+            "Отправьте данные в формате:\n"
+            "`Название, Описание, Дата, Время, Место, Макс. участников`\n\n"
+            "*Пример:*\n"
+            "`Уборка парка, Субботник в парке, 2024-04-10, 14:00, Центральный парк, 30`\n\n"
+            "Попробуйте еще раз или отправьте /cancel для отмены",
+            parse_mode='Markdown'
+        )
+        return ADDING_EVENT
+    
+    return ConversationHandler.END
 
 async def admin_list_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает список мероприятий админу"""
@@ -928,14 +922,8 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /cancel"""
-    if 'adding_event' in context.user_data:
-        context.user_data['adding_event'] = False
-        await update.message.reply_text("✅ Добавление мероприятия отменено.")
-    elif 'awaiting_info' in context.user_data:
-        context.user_data['awaiting_info'] = False
-        await update.message.reply_text("✅ Заполнение данных отменено.")
-    else:
-        await update.message.reply_text("❌ Нечего отменять.")
+    await update.message.reply_text("✅ Операция отменена.")
+    return ConversationHandler.END
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Админ-панель"""
@@ -967,22 +955,22 @@ async def admin_add_event_btn(update: Update, context: ContextTypes.DEFAULT_TYPE
     if query.from_user.id != ADMIN_ID:
         return
     
-    # Отправляем сообщение с инструкцией
     await query.edit_message_text(
         "📝 *Добавление нового мероприятия*\n\n"
         "Отправьте данные в формате:\n\n"
-        "`Название, Дата (ГГГГ-ММ-ДД), Время (ЧЧ:ММ), Место, Макс. участников`\n\n"
+        "`Название, Описание, Дата (ГГГГ-ММ-ДД), Время (ЧЧ:ММ), Место, Макс. участников`\n\n"
         "*Пример:*\n"
-        "`Уборка парка, 2024-04-10, 14:00, Центральный парк, 30`\n\n"
+        "`Уборка парка, Субботник в центральном парке, 2024-04-10, 14:00, Центральный парк, 30`\n\n"
         "📌 *Примечания:*\n"
         "- Дата в формате ГГГГ-ММ-ДД\n"
         "- Время в формате ЧЧ:ММ\n"
         "- Макс. участников: число или 0 для неограниченного\n"
-        "- Для отмены отправьте /cancel",
+        "- Описание не обязательно\n\n"
+        "Для отмены отправьте /cancel",
         parse_mode='Markdown'
     )
     
-    context.user_data['adding_event'] = True
+    context.user_data['state'] = ADDING_EVENT
 
 async def admin_list_events_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопки списка мероприятий"""
@@ -1153,11 +1141,6 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== ОСНОВНАЯ ФУНКЦИЯ ==========
 def main():
-    # Проверяем, что запущен только один экземпляр
-    if not check_single_instance():
-        print("❌ Обнаружено несколько экземпляров бота. Останавливаем...")
-        sys.exit(1)
-    
     print("=" * 50)
     print("🤖 Волонтерский бот запускается...")
     print(f"👑 Админ ID: {ADMIN_ID}")
@@ -1175,14 +1158,37 @@ def main():
     # Добавляем обработчик ошибок
     application.add_error_handler(error_handler)
     
+    # Создаем ConversationHandler для редактирования данных
+    edit_info_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(edit_info_start, pattern='^edit_info$')],
+        states={
+            EDITING_INFO: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_user_info)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel_command)]
+    )
+    
+    # Создаем ConversationHandler для добавления мероприятий
+    add_event_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler('addevent', admin_add_event),
+            CallbackQueryHandler(admin_add_event_btn, pattern='^admin_add_event_btn$')
+        ],
+        states={
+            ADDING_EVENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_new_event)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel_command)]
+    )
+    
     # Регистрируем обработчики команд
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("admin", admin_panel))
-    application.add_handler(CommandHandler("addevent", admin_add_event))
     application.add_handler(CommandHandler("events", admin_list_events))
     application.add_handler(CommandHandler("table", admin_table))
     application.add_handler(CommandHandler("stats", admin_stats))
-    application.add_handler(CommandHandler("cancel", cancel_command))
+    
+    # Регистрируем ConversationHandlers
+    application.add_handler(edit_info_handler)
+    application.add_handler(add_event_handler)
     
     # Регистрируем обработчики callback-запросов
     application.add_handler(CallbackQueryHandler(list_events, pattern='^list_events$'))
@@ -1190,20 +1196,14 @@ def main():
     application.add_handler(CallbackQueryHandler(register_for_event, pattern='^register_'))
     application.add_handler(CallbackQueryHandler(cancel_registration, pattern='^cancel_'))
     application.add_handler(CallbackQueryHandler(my_info, pattern='^my_info$'))
-    application.add_handler(CallbackQueryHandler(edit_info, pattern='^edit_info$'))
     application.add_handler(CallbackQueryHandler(my_registrations, pattern='^my_registrations$'))
     application.add_handler(CallbackQueryHandler(main_menu, pattern='^main_menu$'))
     
     # Админ обработчики кнопок
-    application.add_handler(CallbackQueryHandler(admin_add_event_btn, pattern='^admin_add_event_btn$'))
     application.add_handler(CallbackQueryHandler(admin_list_events_btn, pattern='^admin_list_events_btn$'))
     application.add_handler(CallbackQueryHandler(admin_stats_btn, pattern='^admin_stats_btn$'))
     application.add_handler(CallbackQueryHandler(admin_download_btn, pattern='^admin_download_btn$'))
     application.add_handler(CallbackQueryHandler(admin_back, pattern='^admin_back$'))
-    
-    # Обработчики текстовых сообщений
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, save_user_info))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, save_new_event))
     
     print("✅ Бот запущен и ожидает сообщений...")
     print("=" * 50)
