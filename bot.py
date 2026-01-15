@@ -967,9 +967,22 @@ async def admin_add_event_btn(update: Update, context: ContextTypes.DEFAULT_TYPE
     if query.from_user.id != ADMIN_ID:
         return
     
-    # Правильный вызов
-    update_obj = Update(update_id=update.update_id, callback_query=query)
-    await admin_add_event(update_obj, context)
+    # Отправляем сообщение с инструкцией
+    await query.edit_message_text(
+        "📝 *Добавление нового мероприятия*\n\n"
+        "Отправьте данные в формате:\n\n"
+        "`Название, Дата (ГГГГ-ММ-ДД), Время (ЧЧ:ММ), Место, Макс. участников`\n\n"
+        "*Пример:*\n"
+        "`Уборка парка, 2024-04-10, 14:00, Центральный парк, 30`\n\n"
+        "📌 *Примечания:*\n"
+        "- Дата в формате ГГГГ-ММ-ДД\n"
+        "- Время в формате ЧЧ:ММ\n"
+        "- Макс. участников: число или 0 для неограниченного\n"
+        "- Для отмены отправьте /cancel",
+        parse_mode='Markdown'
+    )
+    
+    context.user_data['adding_event'] = True
 
 async def admin_list_events_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопки списка мероприятий"""
@@ -979,8 +992,37 @@ async def admin_list_events_btn(update: Update, context: ContextTypes.DEFAULT_TY
     if query.from_user.id != ADMIN_ID:
         return
     
-    update_obj = Update(update_id=update.update_id, callback_query=query)
-    await admin_list_events(update_obj, context)
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute('''
+        SELECT id, title, date, time, location, max_volunteers, is_active,
+               (SELECT COUNT(*) FROM registrations WHERE event_id = events.id) as registered
+        FROM events
+        ORDER BY date, time
+    ''')
+    events = cur.fetchall()
+    conn.close()
+    
+    if not events:
+        text = "📭 Нет мероприятий."
+    else:
+        text = "📋 *Все мероприятия:*\n\n"
+        for event in events:
+            event_id, title, date, time, location, max_vol, is_active, registered = event
+            status = "✅ Активно" if is_active else "❌ Неактивно"
+            max_text = f"{max_vol}" if max_vol > 0 else "∞"
+            
+            text += f"🆔 *{event_id}* - {status}\n"
+            text += f"🎯 *{title}*\n"
+            text += f"   📅 {date} ⏰ {time}\n"
+            if location:
+                text += f"   📍 {location}\n"
+            text += f"   👥 {registered}/{max_text} записей\n\n"
+    
+    keyboard = [[InlineKeyboardButton("◀️ Назад в админ-панель", callback_data='admin_back')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
 
 async def admin_stats_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопки статистики"""
@@ -990,8 +1032,47 @@ async def admin_stats_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.from_user.id != ADMIN_ID:
         return
     
-    update_obj = Update(update_id=update.update_id, callback_query=query)
-    await admin_stats(update_obj, context)
+    # Статистика из БД
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    
+    cur.execute("SELECT COUNT(*) FROM users")
+    users_count = cur.fetchone()[0]
+    
+    cur.execute("SELECT COUNT(*) FROM events")
+    events_count = cur.fetchone()[0]
+    
+    cur.execute("SELECT COUNT(*) FROM registrations")
+    regs_count = cur.fetchone()[0]
+    
+    # Популярные мероприятия
+    cur.execute('''
+        SELECT events.title, COUNT(registrations.id) as count
+        FROM events
+        LEFT JOIN registrations ON events.id = registrations.event_id
+        GROUP BY events.id
+        ORDER BY count DESC
+        LIMIT 5
+    ''')
+    popular_events = cur.fetchall()
+    
+    conn.close()
+    
+    # Формируем текст
+    text = "👑 *Статистика для админа*\n\n"
+    text += f"👥 Пользователей: {users_count}\n"
+    text += f"📅 Мероприятий: {events_count}\n"
+    text += f"📝 Записей: {regs_count}\n"
+    text += f"📊 Записей в CSV: {count_csv_lines()}\n\n"
+    
+    text += "🔥 *Самые популярные мероприятия:*\n"
+    for title, count in popular_events:
+        text += f"• {title}: {count} записей\n"
+    
+    keyboard = [[InlineKeyboardButton("◀️ Назад в админ-панель", callback_data='admin_back')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
 
 async def admin_download_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопки скачивания таблицы"""
@@ -1001,8 +1082,54 @@ async def admin_download_btn(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if query.from_user.id != ADMIN_ID:
         return
     
-    update_obj = Update(update_id=update.update_id, callback_query=query)
-    await admin_table(update_obj, context)
+    if not os.path.exists(CSV_FILE):
+        await query.edit_message_text("❌ Таблица еще не создана.")
+        return
+    
+    try:
+        with open(CSV_FILE, 'rb') as f:
+            await context.bot.send_document(
+                chat_id=query.from_user.id,
+                document=f,
+                filename=f'волонтеры_{datetime.now().strftime("%Y-%m-%d")}.csv',
+                caption=f"📊 Таблица волонтеров\nВсего записей: {count_csv_lines()}"
+            )
+        
+        # Возвращаемся к админ-панели
+        keyboard = [[InlineKeyboardButton("◀️ Назад в админ-панель", callback_data='admin_back')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            "✅ Таблица отправлена вам в личные сообщения!",
+            reply_markup=reply_markup
+        )
+        
+        print(f"✅ Таблица отправлена админу {ADMIN_ID}")
+    except Exception as e:
+        await query.edit_message_text(f"❌ Ошибка при отправке таблицы: {e}")
+
+async def admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Возврат в админ-панель"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.from_user.id != ADMIN_ID:
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить мероприятие", callback_data='admin_add_event_btn')],
+        [InlineKeyboardButton("📋 Все мероприятия", callback_data='admin_list_events_btn')],
+        [InlineKeyboardButton("📊 Статистика", callback_data='admin_stats_btn')],
+        [InlineKeyboardButton("📥 Скачать таблицу", callback_data='admin_download_btn')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    text = (
+        "👑 *Админ-панель*\n\n"
+        "Выберите действие для управления волонтерскими мероприятиями:"
+    )
+    
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
 
 # ========== ОБРАБОТЧИК ОШИБОК ==========
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1072,8 +1199,9 @@ def main():
     application.add_handler(CallbackQueryHandler(admin_list_events_btn, pattern='^admin_list_events_btn$'))
     application.add_handler(CallbackQueryHandler(admin_stats_btn, pattern='^admin_stats_btn$'))
     application.add_handler(CallbackQueryHandler(admin_download_btn, pattern='^admin_download_btn$'))
+    application.add_handler(CallbackQueryHandler(admin_back, pattern='^admin_back$'))
     
-    # Обработчик текстовых сообщений
+    # Обработчики текстовых сообщений
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, save_user_info))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, save_new_event))
     
