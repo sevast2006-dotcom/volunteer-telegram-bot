@@ -7,7 +7,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 
 # ========== НАСТРОЙКИ ==========
 TOKEN = os.environ.get('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
-ADMIN_ID = 123456789  # ⬅️ ЗАМЕНИТЕ НА ВАШ TELEGRAM ID!
+ADMIN_ID = 1121098820  # ⬅️ ЗАМЕНИТЕ НА ВАШ TELEGRAM ID!
 
 if TOKEN == 'YOUR_BOT_TOKEN_HERE':
     raise ValueError("❌ Токен бота не найден! Установите BOT_TOKEN в Railway")
