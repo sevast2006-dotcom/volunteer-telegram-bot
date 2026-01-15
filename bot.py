@@ -3,7 +3,7 @@ import sys
 import sqlite3
 import csv
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
@@ -18,7 +18,7 @@ DB_NAME = "volunteer_bot.db"
 CSV_FILE = "volunteers.csv"
 
 # Состояния для ConversationHandler
-EDITING_INFO, ADDING_EVENT = range(2)
+EDITING_INFO, ADDING_EVENT, EDITING_EVENT, MANAGE_EVENT, EDIT_EVENT_DETAILS = range(5)
 
 print(f"🚀 Бот запускается...")
 print(f"👑 Админ ID: {ADMIN_ID}")
@@ -38,7 +38,9 @@ def init_db():
             time TEXT NOT NULL,
             location TEXT,
             max_volunteers INTEGER,
-            is_active BOOLEAN DEFAULT 1
+            is_active BOOLEAN DEFAULT 1,
+            registration_open BOOLEAN DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         
         CREATE TABLE IF NOT EXISTS users (
@@ -65,16 +67,23 @@ def init_db():
     # Добавляем тестовые мероприятия если таблица пуста
     cur.execute("SELECT COUNT(*) FROM events")
     if cur.fetchone()[0] == 0:
+        # Будущие мероприятия
         events = [
-            ("Уборка территории", "Субботник в парке", "2024-03-20", "10:00", "Центральный парк", 50),
-            ("Помощь в библиотеке", "Сортировка книг", "2024-03-22", "14:00", "Главная библиотека", 20),
-            ("Донорская акция", "Сдача крови", "2024-03-25", "09:00", "Медпункт", 30),
+            ("Уборка территории", "Субботник в парке", 
+             (datetime.now() + timedelta(days=2)).strftime('%Y-%m-%d'), 
+             "10:00", "Центральный парк", 50),
+            ("Помощь в библиотеке", "Сортировка книг", 
+             (datetime.now() + timedelta(days=4)).strftime('%Y-%m-%d'), 
+             "14:00", "Главная библиотека", 20),
+            ("Донорская акция", "Сдача крови", 
+             (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d'), 
+             "09:00", "Медпункт", 30),
         ]
         
         for event in events:
             cur.execute('''
-                INSERT INTO events (title, description, date, time, location, max_volunteers)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO events (title, description, date, time, location, max_volunteers, is_active, registration_open)
+                VALUES (?, ?, ?, ?, ?, ?, 1, 1)
             ''', event)
         print("✅ Добавлены тестовые мероприятия")
     
@@ -137,7 +146,7 @@ def count_csv_lines():
 
 # ========== ФУНКЦИИ ДЛЯ РАБОТЫ С БАЗОЙ ==========
 def get_active_events():
-    """Получает список активных мероприятий"""
+    """Получает список активных мероприятий (только для пользователей)"""
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
     cur.execute('''
@@ -146,10 +155,27 @@ def get_active_events():
                (events.max_volunteers - COUNT(registrations.id)) as available_spots
         FROM events
         LEFT JOIN registrations ON events.id = registrations.event_id
-        WHERE events.is_active = 1 AND events.date >= date('now')
+        WHERE events.is_active = 1 
+          AND events.registration_open = 1
+          AND events.date >= date('now')
         GROUP BY events.id
         HAVING available_spots > 0 OR events.max_volunteers IS NULL
         ORDER BY events.date, events.time
+    ''')
+    events = cur.fetchall()
+    conn.close()
+    return events
+
+def get_all_events_admin():
+    """Получает ВСЕ мероприятия для админа"""
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute('''
+        SELECT id, title, date, time, location, max_volunteers, description,
+               is_active, registration_open,
+               (SELECT COUNT(*) FROM registrations WHERE event_id = events.id) as registered
+        FROM events
+        ORDER BY date, time
     ''')
     events = cur.fetchall()
     conn.close()
@@ -170,6 +196,79 @@ def get_user_registrations(user_id):
     events = cur.fetchall()
     conn.close()
     return events
+
+def toggle_event_status(event_id, field):
+    """Включает/выключает мероприятие или запись на него"""
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    
+    if field == 'is_active':
+        cur.execute('SELECT is_active FROM events WHERE id = ?', (event_id,))
+        current = cur.fetchone()[0]
+        new_value = 0 if current == 1 else 1
+        cur.execute('UPDATE events SET is_active = ? WHERE id = ?', (new_value, event_id))
+        action = "активировано" if new_value == 1 else "деактивировано"
+    
+    elif field == 'registration_open':
+        cur.execute('SELECT registration_open FROM events WHERE id = ?', (event_id,))
+        current = cur.fetchone()[0]
+        new_value = 0 if current == 1 else 1
+        cur.execute('UPDATE events SET registration_open = ? WHERE id = ?', (new_value, event_id))
+        action = "открыта" if new_value == 1 else "закрыта"
+    
+    conn.commit()
+    conn.close()
+    return action
+
+def delete_event(event_id):
+    """Удаляет мероприятие"""
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    
+    # Сначала удаляем все записи на это мероприятие
+    cur.execute('DELETE FROM registrations WHERE event_id = ?', (event_id,))
+    # Затем удаляем само мероприятие
+    cur.execute('DELETE FROM events WHERE id = ?', (event_id,))
+    deleted = cur.rowcount
+    
+    conn.commit()
+    conn.close()
+    return deleted > 0
+
+def get_event_details(event_id):
+    """Получает детали мероприятия"""
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute('''
+        SELECT title, description, date, time, location, max_volunteers, 
+               is_active, registration_open
+        FROM events WHERE id = ?
+    ''', (event_id,))
+    event = cur.fetchone()
+    conn.close()
+    return event
+
+def update_event(event_id, field, value):
+    """Обновляет поле мероприятия"""
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    
+    if field == 'title':
+        cur.execute('UPDATE events SET title = ? WHERE id = ?', (value, event_id))
+    elif field == 'description':
+        cur.execute('UPDATE events SET description = ? WHERE id = ?', (value, event_id))
+    elif field == 'date':
+        cur.execute('UPDATE events SET date = ? WHERE id = ?', (value, event_id))
+    elif field == 'time':
+        cur.execute('UPDATE events SET time = ? WHERE id = ?', (value, event_id))
+    elif field == 'location':
+        cur.execute('UPDATE events SET location = ? WHERE id = ?', (value, event_id))
+    elif field == 'max_volunteers':
+        cur.execute('UPDATE events SET max_volunteers = ? WHERE id = ?', (int(value), event_id))
+    
+    conn.commit()
+    conn.close()
+    return True
 
 # ========== ОСНОВНЫЕ КОМАНДЫ БОТА ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -201,7 +300,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def list_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает список активных мероприятий"""
+    """Показывает список активных мероприятий ДЛЯ ПОЛЬЗОВАТЕЛЕЙ"""
     query = update.callback_query
     await query.answer()
     
@@ -216,8 +315,8 @@ async def list_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(
-            "📭 *На данный момент нет активных мероприятий.*\n\n"
-            "Загляните позже!",
+            "📭 *На данный момент нет доступных мероприятий для записи.*\n\n"
+            "Загляните позже или свяжитесь с организаторами!",
             reply_markup=reply_markup,
             parse_mode='Markdown'
         )
@@ -237,7 +336,7 @@ async def list_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     # Формируем текст со списком мероприятий
-    events_text = "📅 *Доступные мероприятия:*\n\n"
+    events_text = "📅 *Доступные мероприятия для записи:*\n\n"
     for i, event in enumerate(events[:5], 1):
         event_id, title, date, time, location, max_vol, desc, available = event
         events_text += f"{i}. *{title}*\n"
@@ -271,7 +370,7 @@ async def event_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Получаем информацию о мероприятии
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-    cur.execute('SELECT title, description, date, time, location, max_volunteers FROM events WHERE id = ?', (event_id,))
+    cur.execute('SELECT title, description, date, time, location, max_volunteers, registration_open FROM events WHERE id = ?', (event_id,))
     event = cur.fetchone()
     
     if not event:
@@ -279,7 +378,7 @@ async def event_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         return
     
-    title, desc, date, time, location, max_vol = event
+    title, desc, date, time, location, max_vol, registration_open = event
     
     # Проверяем, записан ли пользователь
     cur.execute('SELECT id FROM registrations WHERE user_id = ? AND event_id = ?', 
@@ -295,16 +394,21 @@ async def event_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += f"⏰ *Время:* {time}\n"
     if location:
         text += f"📍 *Место:* {location}\n"
-    text += f"👥 *Участников:* {max_vol if max_vol else 'без ограничений'}\n\n"
+    text += f"👥 *Участников:* {max_vol if max_vol else 'без ограничений'}\n"
+    
+    if not registration_open:
+        text += f"❌ *Запись закрыта*\n\n"
+    else:
+        text += f"✅ *Запись открыта*\n\n"
     
     if is_registered:
         text += "✅ *Вы уже записаны на это мероприятие*\n\n"
     
     # Создаем кнопки
     keyboard = []
-    if not is_registered:
+    if registration_open and not is_registered:
         keyboard.append([InlineKeyboardButton("✅ Записаться", callback_data=f'register_{event_id}')])
-    else:
+    elif is_registered:
         keyboard.append([InlineKeyboardButton("❌ Отменить запись", callback_data=f'cancel_{event_id}')])
     
     keyboard.append([InlineKeyboardButton("📅 К списку мероприятий", callback_data='list_events')])
@@ -523,8 +627,8 @@ async def register_for_event(update: Update, context: ContextTypes.DEFAULT_TYPE)
         conn.close()
         return
     
-    # 2. Проверяем мероприятие
-    cur.execute('SELECT title, date, time, location, max_volunteers FROM events WHERE id = ?', (event_id,))
+    # 2. Проверяем мероприятие и открыта ли запись
+    cur.execute('SELECT title, date, time, location, max_volunteers, registration_open FROM events WHERE id = ?', (event_id,))
     event = cur.fetchone()
     
     if not event:
@@ -532,7 +636,12 @@ async def register_for_event(update: Update, context: ContextTypes.DEFAULT_TYPE)
         conn.close()
         return
     
-    title, date, time, location, max_vol = event
+    title, date, time, location, max_vol, registration_open = event
+    
+    if not registration_open:
+        await query.answer("❌ Запись на это мероприятие закрыта!", show_alert=True)
+        conn.close()
+        return
     
     # 3. Проверяем, не записан ли уже
     cur.execute('SELECT id FROM registrations WHERE user_id = ? AND event_id = ?', (user_id, event_id))
@@ -789,8 +898,8 @@ async def save_new_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn = sqlite3.connect(DB_NAME)
             cur = conn.cursor()
             cur.execute('''
-                INSERT INTO events (title, description, date, time, location, max_volunteers, is_active)
-                VALUES (?, ?, ?, ?, ?, ?, 1)
+                INSERT INTO events (title, description, date, time, location, max_volunteers, is_active, registration_open)
+                VALUES (?, ?, ?, ?, ?, ?, 1, 1)
             ''', (title, description, date, time, location, max_volunteers))
             event_id = cur.lastrowid
             conn.commit()
@@ -847,34 +956,423 @@ async def admin_list_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ У вас нет прав доступа.")
         return
     
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute('''
-        SELECT id, title, date, time, location, max_volunteers, is_active,
-               (SELECT COUNT(*) FROM registrations WHERE event_id = events.id) as registered
-        FROM events
-        ORDER BY date, time
-    ''')
-    events = cur.fetchall()
-    conn.close()
+    events = get_all_events_admin()
     
     if not events:
         text = "📭 Нет мероприятий."
     else:
         text = "📋 *Все мероприятия:*\n\n"
         for event in events:
-            event_id, title, date, time, location, max_vol, is_active, registered = event
-            status = "✅ Активно" if is_active else "❌ Неактивно"
+            event_id, title, date, time, location, max_vol, desc, is_active, registration_open, registered = event
+            status = "✅ Активно" if is_active == 1 else "❌ Неактивно"
+            reg_status = "✅ Открыта" if registration_open == 1 else "❌ Закрыта"
             max_text = f"{max_vol}" if max_vol > 0 else "∞"
             
-            text += f"🆔 *{event_id}* - {status}\n"
+            text += f"🆔 *{event_id}*\n"
             text += f"🎯 *{title}*\n"
             text += f"   📅 {date} ⏰ {time}\n"
             if location:
                 text += f"   📍 {location}\n"
-            text += f"   👥 {registered}/{max_text} записей\n\n"
+            text += f"   👥 {registered}/{max_text} записей\n"
+            text += f"   🏷️ Статус: {status}\n"
+            text += f"   📝 Запись: {reg_status}\n\n"
     
     await update.message.reply_text(text, parse_mode='Markdown')
+
+async def admin_manage_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню управления мероприятиями для админа"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.from_user.id != ADMIN_ID:
+        return
+    
+    events = get_all_events_admin()
+    
+    if not events:
+        keyboard = [[InlineKeyboardButton("◀️ Назад в админ-панель", callback_data='admin_back')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            "📭 Нет мероприятий для управления.",
+            reply_markup=reply_markup
+        )
+        return
+    
+    # Создаем кнопки для каждого мероприятия
+    keyboard = []
+    for event in events:
+        event_id, title, date, time, location, max_vol, desc, is_active, registration_open, registered = event
+        button_text = f"🆔{event_id}: {title[:20]}"
+        if len(title) > 20:
+            button_text += "..."
+        button_text += f" ({date})"
+        
+        # Иконки статуса
+        status_icon = "✅" if is_active == 1 else "❌"
+        reg_icon = "📝" if registration_open == 1 else "🔒"
+        
+        button_text = f"{status_icon}{reg_icon} {button_text}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f'manage_{event_id}')])
+    
+    keyboard.append([InlineKeyboardButton("◀️ Назад в админ-панель", callback_data='admin_back')])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        "🔧 *Управление мероприятиями*\n\n"
+        "Выберите мероприятие для управления:\n"
+        "✅❌ - активность мероприятия\n"
+        "📝🔒 - статус записи\n\n"
+        f"Всего мероприятий: {len(events)}",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+async def manage_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Управление конкретным мероприятием"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.from_user.id != ADMIN_ID:
+        return
+    
+    try:
+        event_id = int(query.data.split('_')[1])
+    except:
+        await query.edit_message_text("❌ Ошибка: неверный ID мероприятия")
+        return
+    
+    event = get_event_details(event_id)
+    if not event:
+        await query.edit_message_text("❌ Мероприятие не найдено.")
+        return
+    
+    title, desc, date, time, location, max_vol, is_active, registration_open = event
+    
+    # Получаем количество записанных
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute('SELECT COUNT(*) FROM registrations WHERE event_id = ?', (event_id,))
+    registered = cur.fetchone()[0]
+    conn.close()
+    
+    # Формируем текст
+    text = f"🔧 *Управление мероприятием*\n\n"
+    text += f"🆔 *ID:* {event_id}\n"
+    text += f"🎯 *Название:* {title}\n"
+    if desc:
+        text += f"📝 *Описание:* {desc}\n"
+    text += f"📅 *Дата:* {date}\n"
+    text += f"⏰ *Время:* {time}\n"
+    if location:
+        text += f"📍 *Место:* {location}\n"
+    text += f"👥 *Участников:* {registered}/{max_vol if max_vol > 0 else '∞'}\n"
+    text += f"🏷️ *Статус:* {'✅ Активно' if is_active == 1 else '❌ Неактивно'}\n"
+    text += f"📝 *Запись:* {'✅ Открыта' if registration_open == 1 else '❌ Закрыта'}\n"
+    
+    # Создаем кнопки управления
+    keyboard = []
+    
+    # Кнопки для управления статусом
+    if is_active == 1:
+        keyboard.append([InlineKeyboardButton("❌ Деактивировать мероприятие", callback_data=f'deactivate_{event_id}')])
+    else:
+        keyboard.append([InlineKeyboardButton("✅ Активировать мероприятие", callback_data=f'activate_{event_id}')])
+    
+    # Кнопки для управления записью
+    if registration_open == 1:
+        keyboard.append([InlineKeyboardButton("🔒 Закрыть запись", callback_data=f'close_reg_{event_id}')])
+    else:
+        keyboard.append([InlineKeyboardButton("📝 Открыть запись", callback_data=f'open_reg_{event_id}')])
+    
+    # Кнопки для редактирования
+    keyboard.append([InlineKeyboardButton("✏️ Изменить данные", callback_data=f'edit_{event_id}')])
+    
+    # Кнопка удаления
+    keyboard.append([InlineKeyboardButton("🗑️ Удалить мероприятие", callback_data=f'delete_{event_id}')])
+    
+    # Кнопка просмотра записавшихся
+    keyboard.append([InlineKeyboardButton("👥 Просмотреть записавшихся", callback_data=f'view_reg_{event_id}')])
+    
+    keyboard.append([InlineKeyboardButton("◀️ Назад к списку", callback_data='admin_manage')])
+    keyboard.append([InlineKeyboardButton("🏠 В админ-панель", callback_data='admin_back')])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        text,
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+async def handle_event_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает действия с мероприятиями"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.from_user.id != ADMIN_ID:
+        return
+    
+    try:
+        action = query.data.split('_')[0]
+        event_id = int(query.data.split('_')[1])
+    except:
+        await query.edit_message_text("❌ Ошибка обработки действия")
+        return
+    
+    event = get_event_details(event_id)
+    if not event:
+        await query.edit_message_text("❌ Мероприятие не найдено.")
+        return
+    
+    title = event[0]
+    
+    if action == 'activate':
+        action_text = toggle_event_status(event_id, 'is_active')
+        message = f"✅ Мероприятие '{title}' активировано."
+    
+    elif action == 'deactivate':
+        action_text = toggle_event_status(event_id, 'is_active')
+        message = f"❌ Мероприятие '{title}' деактивировано."
+    
+    elif action == 'open' and 'reg' in query.data:
+        action_text = toggle_event_status(event_id, 'registration_open')
+        message = f"📝 Запись на мероприятие '{title}' открыта."
+    
+    elif action == 'close' and 'reg' in query.data:
+        action_text = toggle_event_status(event_id, 'registration_open')
+        message = f"🔒 Запись на мероприятие '{title}' закрыта."
+    
+    elif action == 'delete':
+        if delete_event(event_id):
+            message = f"🗑️ Мероприятие '{title}' удалено."
+            # Возвращаемся к списку
+            await admin_manage_events(update, context)
+            return
+        else:
+            message = f"❌ Ошибка при удалении мероприятия."
+    
+    elif action == 'edit':
+        context.user_data['editing_event_id'] = event_id
+        context.user_data['editing_field'] = None
+        
+        keyboard = [
+            [InlineKeyboardButton("✏️ Название", callback_data=f'edit_field_title_{event_id}')],
+            [InlineKeyboardButton("📝 Описание", callback_data=f'edit_field_desc_{event_id}')],
+            [InlineKeyboardButton("📅 Дата", callback_data=f'edit_field_date_{event_id}')],
+            [InlineKeyboardButton("⏰ Время", callback_data=f'edit_field_time_{event_id}')],
+            [InlineKeyboardButton("📍 Место", callback_data=f'edit_field_location_{event_id}')],
+            [InlineKeyboardButton("👥 Макс. участников", callback_data=f'edit_field_max_{event_id}')],
+            [InlineKeyboardButton("◀️ Назад", callback_data=f'manage_{event_id}')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"✏️ *Редактирование мероприятия:* {title}\n\n"
+            "Выберите поле для редактирования:",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        return
+    
+    elif action == 'view' and 'reg' in query.data:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute('''
+            SELECT users.full_name, users.group_name, users.phone_number, users.username
+            FROM registrations
+            JOIN users ON registrations.user_id = users.telegram_id
+            WHERE registrations.event_id = ?
+            ORDER BY registrations.registration_date
+        ''', (event_id,))
+        registrations = cur.fetchall()
+        conn.close()
+        
+        if not registrations:
+            text = f"👥 *Записанные на мероприятие:* {title}\n\n"
+            text += "Пока никто не записался."
+        else:
+            text = f"👥 *Записанные на мероприятие:* {title}\n"
+            text += f"Всего записей: {len(registrations)}\n\n"
+            
+            for i, reg in enumerate(registrations, 1):
+                full_name, group_name, phone, username = reg
+                text += f"{i}. *{full_name}*\n"
+                if group_name:
+                    text += f"   Группа: {group_name}\n"
+                if phone:
+                    text += f"   Телефон: {phone}\n"
+                if username:
+                    text += f"   @{username.replace('@', '')}\n"
+                text += "\n"
+        
+        keyboard = [[InlineKeyboardButton("◀️ Назад к управлению", callback_data=f'manage_{event_id}')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        return
+    
+    else:
+        message = "❌ Неизвестное действие."
+    
+    # Показываем сообщение об успехе и возвращаемся к управлению
+    await query.answer(message, show_alert=True)
+    # Обновляем меню управления
+    await manage_event(update, context)
+
+async def edit_event_field_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начинает редактирование поля мероприятия"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.from_user.id != ADMIN_ID:
+        return
+    
+    try:
+        field = query.data.split('_')[2]
+        event_id = int(query.data.split('_')[3])
+    except:
+        await query.edit_message_text("❌ Ошибка")
+        return
+    
+    event = get_event_details(event_id)
+    if not event:
+        await query.edit_message_text("❌ Мероприятие не найдено.")
+        return
+    
+    title, desc, date, time, location, max_vol, is_active, registration_open = event
+    
+    field_names = {
+        'title': 'Название',
+        'desc': 'Описание',
+        'date': 'Дату (ГГГГ-ММ-ДД)',
+        'time': 'Время (ЧЧ:ММ)',
+        'location': 'Место',
+        'max': 'Максимальное количество участников'
+    }
+    
+    field_values = {
+        'title': title,
+        'desc': desc,
+        'date': date,
+        'time': time,
+        'location': location,
+        'max': str(max_vol)
+    }
+    
+    field_name = field_names.get(field, 'поле')
+    current_value = field_values.get(field, '')
+    
+    await query.edit_message_text(
+        f"✏️ *Редактирование {field_name}*\n\n"
+        f"Текущее значение: `{current_value}`\n\n"
+        f"Отправьте новое значение.\n"
+        f"Для отмены отправьте /cancel",
+        parse_mode='Markdown'
+    )
+    
+    context.user_data['editing_event_id'] = event_id
+    context.user_data['editing_field'] = field
+    
+    return EDIT_EVENT_DETAILS
+
+async def save_event_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сохраняет отредактированное поле мероприятия"""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ У вас нет прав доступа.")
+        return ConversationHandler.END
+    
+    text = update.message.text.strip()
+    
+    if text.lower() == '/cancel':
+        await update.message.reply_text("✅ Редактирование отменено.")
+        return ConversationHandler.END
+    
+    event_id = context.user_data.get('editing_event_id')
+    field = context.user_data.get('editing_field')
+    
+    if not event_id or not field:
+        await update.message.reply_text("❌ Ошибка: данные не найдены.")
+        return ConversationHandler.END
+    
+    event = get_event_details(event_id)
+    if not event:
+        await update.message.reply_text("❌ Мероприятие не найдено.")
+        return ConversationHandler.END
+    
+    title = event[0]
+    
+    try:
+        # Валидация в зависимости от поля
+        if field == 'date':
+            try:
+                datetime.strptime(text, '%Y-%m-%d')
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ Неверный формат даты! Используйте ГГГГ-ММ-ДД\n"
+                    "Пример: 2024-04-10\n\n"
+                    "Попробуйте еще раз или отправьте /cancel для отмены"
+                )
+                return EDIT_EVENT_DETAILS
+        
+        elif field == 'time':
+            try:
+                datetime.strptime(text, '%H:%M')
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ Неверный формат времени! Используйте ЧЧ:ММ\n"
+                    "Пример: 14:00\n\n"
+                    "Попробуйте еще раз или отправьте /cancel для отмены"
+                )
+                return EDIT_EVENT_DETAILS
+        
+        elif field == 'max':
+            if not text.isdigit() and text != '0':
+                await update.message.reply_text(
+                    "❌ Введите число для максимального количества участников!\n"
+                    "Или 0 для неограниченного количества.\n\n"
+                    "Попробуйте еще раз или отправьте /cancel для отмены"
+                )
+                return EDIT_EVENT_DETAILS
+        
+        # Обновляем поле
+        db_field = {
+            'title': 'title',
+            'desc': 'description',
+            'date': 'date',
+            'time': 'time',
+            'location': 'location',
+            'max': 'max_volunteers'
+        }.get(field)
+        
+        if db_field:
+            update_event(event_id, db_field, text)
+        
+        await update.message.reply_text(
+            f"✅ Поле мероприятия '{title}' успешно обновлено!\n"
+            f"Новое значение: `{text}`",
+            parse_mode='Markdown'
+        )
+        
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Ошибка при обновлении: {e}\n\n"
+            "Попробуйте еще раз или отправьте /cancel для отмены"
+        )
+        return EDIT_EVENT_DETAILS
+    
+    # Очищаем контекст
+    if 'editing_event_id' in context.user_data:
+        del context.user_data['editing_event_id']
+    if 'editing_field' in context.user_data:
+        del context.user_data['editing_field']
+    
+    return ConversationHandler.END
 
 async def admin_table(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отправляет CSV таблицу админу"""
@@ -910,8 +1408,14 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.execute("SELECT COUNT(*) FROM users")
     users_count = cur.fetchone()[0]
     
-    cur.execute("SELECT COUNT(*) FROM events")
-    events_count = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM events WHERE is_active = 1")
+    active_events = cur.fetchone()[0]
+    
+    cur.execute("SELECT COUNT(*) FROM events WHERE is_active = 0")
+    inactive_events = cur.fetchone()[0]
+    
+    cur.execute("SELECT COUNT(*) FROM events WHERE registration_open = 1 AND is_active = 1")
+    open_events = cur.fetchone()[0]
     
     cur.execute("SELECT COUNT(*) FROM registrations")
     regs_count = cur.fetchone()[0]
@@ -921,6 +1425,7 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         SELECT events.title, COUNT(registrations.id) as count
         FROM events
         LEFT JOIN registrations ON events.id = registrations.event_id
+        WHERE events.is_active = 1
         GROUP BY events.id
         ORDER BY count DESC
         LIMIT 5
@@ -932,8 +1437,11 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Формируем текст
     text = "👑 *Статистика для админа*\n\n"
     text += f"👥 Пользователей: {users_count}\n"
-    text += f"📅 Мероприятий: {events_count}\n"
-    text += f"📝 Записей: {regs_count}\n"
+    text += f"📅 Всего мероприятий: {active_events + inactive_events}\n"
+    text += f"   ✅ Активных: {active_events}\n"
+    text += f"   ❌ Неактивных: {inactive_events}\n"
+    text += f"   📝 С открытой записью: {open_events}\n"
+    text += f"📝 Всего записей: {regs_count}\n"
     text += f"📊 Записей в CSV: {count_csv_lines()}\n\n"
     
     text += "🔥 *Самые популярные мероприятия:*\n"
@@ -949,6 +1457,10 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Сбрасываем флаги
     if 'adding_event' in context.user_data:
         del context.user_data['adding_event']
+    if 'editing_event_id' in context.user_data:
+        del context.user_data['editing_event_id']
+    if 'editing_field' in context.user_data:
+        del context.user_data['editing_field']
     
     return ConversationHandler.END
 
@@ -960,9 +1472,10 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [InlineKeyboardButton("➕ Добавить мероприятие", callback_data='admin_add_event')],
-        [InlineKeyboardButton("📋 Все мероприятия", callback_data='admin_list_events')],
-        [InlineKeyboardButton("📊 Статистика", callback_data='admin_stats')],
-        [InlineKeyboardButton("📥 Скачать таблицу", callback_data='admin_table')]
+        [InlineKeyboardButton("🔧 Управление мероприятиями", callback_data='admin_manage')],
+        [InlineKeyboardButton("📋 Все мероприятия", callback_data='admin_list_events_btn')],
+        [InlineKeyboardButton("📊 Статистика", callback_data='admin_stats_btn')],
+        [InlineKeyboardButton("📥 Скачать таблицу", callback_data='admin_table_btn')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -998,7 +1511,6 @@ async def admin_add_event_btn(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     
     context.user_data['adding_event'] = True
-    context.user_data['from_callback'] = True
 
 async def admin_list_events_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик кнопки списка мероприятий"""
@@ -1008,32 +1520,26 @@ async def admin_list_events_btn(update: Update, context: ContextTypes.DEFAULT_TY
     if query.from_user.id != ADMIN_ID:
         return
     
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute('''
-        SELECT id, title, date, time, location, max_volunteers, is_active,
-               (SELECT COUNT(*) FROM registrations WHERE event_id = events.id) as registered
-        FROM events
-        ORDER BY date, time
-    ''')
-    events = cur.fetchall()
-    conn.close()
+    events = get_all_events_admin()
     
     if not events:
         text = "📭 Нет мероприятий."
     else:
         text = "📋 *Все мероприятия:*\n\n"
         for event in events:
-            event_id, title, date, time, location, max_vol, is_active, registered = event
-            status = "✅ Активно" if is_active else "❌ Неактивно"
+            event_id, title, date, time, location, max_vol, desc, is_active, registration_open, registered = event
+            status = "✅ Активно" if is_active == 1 else "❌ Неактивно"
+            reg_status = "✅ Открыта" if registration_open == 1 else "❌ Закрыта"
             max_text = f"{max_vol}" if max_vol > 0 else "∞"
             
-            text += f"🆔 *{event_id}* - {status}\n"
+            text += f"🆔 *{event_id}*\n"
             text += f"🎯 *{title}*\n"
             text += f"   📅 {date} ⏰ {time}\n"
             if location:
                 text += f"   📍 {location}\n"
-            text += f"   👥 {registered}/{max_text} записей\n\n"
+            text += f"   👥 {registered}/{max_text} записей\n"
+            text += f"   🏷️ Статус: {status}\n"
+            text += f"   📝 Запись: {reg_status}\n\n"
     
     keyboard = [[InlineKeyboardButton("◀️ Назад в админ-панель", callback_data='admin_back')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1055,8 +1561,14 @@ async def admin_stats_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cur.execute("SELECT COUNT(*) FROM users")
     users_count = cur.fetchone()[0]
     
-    cur.execute("SELECT COUNT(*) FROM events")
-    events_count = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM events WHERE is_active = 1")
+    active_events = cur.fetchone()[0]
+    
+    cur.execute("SELECT COUNT(*) FROM events WHERE is_active = 0")
+    inactive_events = cur.fetchone()[0]
+    
+    cur.execute("SELECT COUNT(*) FROM events WHERE registration_open = 1 AND is_active = 1")
+    open_events = cur.fetchone()[0]
     
     cur.execute("SELECT COUNT(*) FROM registrations")
     regs_count = cur.fetchone()[0]
@@ -1066,6 +1578,7 @@ async def admin_stats_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         SELECT events.title, COUNT(registrations.id) as count
         FROM events
         LEFT JOIN registrations ON events.id = registrations.event_id
+        WHERE events.is_active = 1
         GROUP BY events.id
         ORDER BY count DESC
         LIMIT 5
@@ -1077,8 +1590,11 @@ async def admin_stats_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Формируем текст
     text = "👑 *Статистика для админа*\n\n"
     text += f"👥 Пользователей: {users_count}\n"
-    text += f"📅 Мероприятий: {events_count}\n"
-    text += f"📝 Записей: {regs_count}\n"
+    text += f"📅 Всего мероприятий: {active_events + inactive_events}\n"
+    text += f"   ✅ Активных: {active_events}\n"
+    text += f"   ❌ Неактивных: {inactive_events}\n"
+    text += f"   📝 С открытой записью: {open_events}\n"
+    text += f"📝 Всего записей: {regs_count}\n"
     text += f"📊 Записей в CSV: {count_csv_lines()}\n\n"
     
     text += "🔥 *Самые популярные мероприятия:*\n"
@@ -1134,9 +1650,10 @@ async def admin_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [InlineKeyboardButton("➕ Добавить мероприятие", callback_data='admin_add_event')],
-        [InlineKeyboardButton("📋 Все мероприятия", callback_data='admin_list_events')],
-        [InlineKeyboardButton("📊 Статистика", callback_data='admin_stats')],
-        [InlineKeyboardButton("📥 Скачать таблицу", callback_data='admin_table')]
+        [InlineKeyboardButton("🔧 Управление мероприятиями", callback_data='admin_manage')],
+        [InlineKeyboardButton("📋 Все мероприятия", callback_data='admin_list_events_btn')],
+        [InlineKeyboardButton("📊 Статистика", callback_data='admin_stats_btn')],
+        [InlineKeyboardButton("📥 Скачать таблицу", callback_data='admin_table_btn')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -1217,6 +1734,15 @@ def main():
         fallbacks=[CommandHandler('cancel', cancel_command)]
     )
     
+    # Создаем ConversationHandler для редактирования мероприятий
+    edit_event_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(edit_event_field_start, pattern='^edit_field_')],
+        states={
+            EDIT_EVENT_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_event_field)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel_command)]
+    )
+    
     # Регистрируем обработчики команд
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("admin", admin_panel))
@@ -1227,6 +1753,7 @@ def main():
     # Регистрируем ConversationHandlers
     application.add_handler(edit_info_handler)
     application.add_handler(add_event_handler)
+    application.add_handler(edit_event_handler)
     
     # Регистрируем обработчики callback-запросов
     application.add_handler(CallbackQueryHandler(list_events, pattern='^list_events$'))
@@ -1239,10 +1766,15 @@ def main():
     
     # Админ обработчики кнопок
     application.add_handler(CallbackQueryHandler(admin_add_event_btn, pattern='^admin_add_event$'))
-    application.add_handler(CallbackQueryHandler(admin_list_events_btn, pattern='^admin_list_events$'))
-    application.add_handler(CallbackQueryHandler(admin_stats_btn, pattern='^admin_stats$'))
-    application.add_handler(CallbackQueryHandler(admin_table_btn, pattern='^admin_table$'))
+    application.add_handler(CallbackQueryHandler(admin_manage_events, pattern='^admin_manage$'))
+    application.add_handler(CallbackQueryHandler(admin_list_events_btn, pattern='^admin_list_events_btn$'))
+    application.add_handler(CallbackQueryHandler(admin_stats_btn, pattern='^admin_stats_btn$'))
+    application.add_handler(CallbackQueryHandler(admin_table_btn, pattern='^admin_table_btn$'))
     application.add_handler(CallbackQueryHandler(admin_back, pattern='^admin_back$'))
+    
+    # Обработчики управления мероприятиями
+    application.add_handler(CallbackQueryHandler(manage_event, pattern='^manage_'))
+    application.add_handler(CallbackQueryHandler(handle_event_action, pattern='^(activate|deactivate|close_reg|open_reg|delete|edit|view_reg)_'))
     
     # Обработчик сообщений для добавления мероприятий из кнопок
     application.add_handler(MessageHandler(
