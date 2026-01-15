@@ -1,13 +1,51 @@
 import os
+import sys
 import sqlite3
 import csv
+import time
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
+# ========== ПРОВЕРКА НА ОДИН ЭКЗЕМПЛЯР ==========
+def check_single_instance():
+    """Проверяет, что запущен только один экземпляр бота"""
+    lock_file = '/tmp/bot.lock'
+    
+    # Проверяем существование lock файла
+    if os.path.exists(lock_file):
+        try:
+            # Читаем PID из файла
+            with open(lock_file, 'r') as f:
+                old_pid = int(f.read().strip())
+            
+            # Проверяем, жив ли процесс
+            try:
+                os.kill(old_pid, 0)  # Процесс существует
+                print(f"❌ Бот уже запущен с PID {old_pid}. Останавливаем...")
+                return False
+            except OSError:
+                # Процесс умер, удаляем старый lock файл
+                os.remove(lock_file)
+                print(f"⚠️ Удален старый lock файл от умершего процесса {old_pid}")
+        except:
+            # Ошибка чтения файла, удаляем его
+            if os.path.exists(lock_file):
+                os.remove(lock_file)
+    
+    # Создаем новый lock файл
+    with open(lock_file, 'w') as f:
+        f.write(str(os.getpid()))
+    
+    # Удаляем lock файл при выходе
+    import atexit
+    atexit.register(lambda: os.remove(lock_file) if os.path.exists(lock_file) else None)
+    
+    return True
+
 # ========== НАСТРОЙКИ ==========
 TOKEN = os.environ.get('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
-ADMIN_ID = 1121098820  # ⬅️ ЗАМЕНИТЕ НА ВАШ TELEGRAM ID!
+ADMIN_ID = 123456789  # ⬅️ ЗАМЕНИТЕ НА ВАШ TELEGRAM ID!
 
 if TOKEN == 'YOUR_BOT_TOKEN_HERE':
     raise ValueError("❌ Токен бота не найден! Установите BOT_TOKEN в Railway")
@@ -694,7 +732,7 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
 
-# ========== АДМИН КОМАНДЫ: ДОБАВЛЕНИЕ МЕРОПРИЯТИЙ ==========
+# ========== АДМИН КОМАНДЫ ==========
 async def admin_add_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начало процесса добавления мероприятия"""
     if update.effective_user.id != ADMIN_ID:
@@ -822,7 +860,6 @@ async def admin_list_events(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(text, parse_mode='Markdown')
 
-# ========== АДМИН КОМАНДЫ: УПРАВЛЕНИЕ ==========
 async def admin_table(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отправляет CSV таблицу админу"""
     if update.effective_user.id != ADMIN_ID:
@@ -930,8 +967,8 @@ async def admin_add_event_btn(update: Update, context: ContextTypes.DEFAULT_TYPE
     if query.from_user.id != ADMIN_ID:
         return
     
-    # Исправленный вызов
-    update_obj = Update(update_id=update.update_id, message=query.message)
+    # Правильный вызов
+    update_obj = Update(update_id=update.update_id, callback_query=query)
     await admin_add_event(update_obj, context)
 
 async def admin_list_events_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -942,7 +979,7 @@ async def admin_list_events_btn(update: Update, context: ContextTypes.DEFAULT_TY
     if query.from_user.id != ADMIN_ID:
         return
     
-    update_obj = Update(update_id=update.update_id, message=query.message)
+    update_obj = Update(update_id=update.update_id, callback_query=query)
     await admin_list_events(update_obj, context)
 
 async def admin_stats_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -953,7 +990,7 @@ async def admin_stats_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.from_user.id != ADMIN_ID:
         return
     
-    update_obj = Update(update_id=update.update_id, message=query.message)
+    update_obj = Update(update_id=update.update_id, callback_query=query)
     await admin_stats(update_obj, context)
 
 async def admin_download_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -964,7 +1001,7 @@ async def admin_download_btn(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if query.from_user.id != ADMIN_ID:
         return
     
-    update_obj = Update(update_id=update.update_id, message=query.message)
+    update_obj = Update(update_id=update.update_id, callback_query=query)
     await admin_table(update_obj, context)
 
 # ========== ОБРАБОТЧИК ОШИБОК ==========
@@ -989,9 +1026,10 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== ОСНОВНАЯ ФУНКЦИЯ ==========
 def main():
-    # Инициализируем БД и CSV
-    init_db()
-    init_csv()
+    # Проверяем, что запущен только один экземпляр
+    if not check_single_instance():
+        print("❌ Обнаружено несколько экземпляров бота. Останавливаем...")
+        sys.exit(1)
     
     print("=" * 50)
     print("🤖 Волонтерский бот запускается...")
@@ -999,6 +1037,10 @@ def main():
     print(f"💾 База данных: {DB_NAME}")
     print(f"📊 CSV таблица: {CSV_FILE}")
     print("=" * 50)
+    
+    # Инициализируем БД и CSV
+    init_db()
+    init_csv()
     
     # Создаем приложение
     application = Application.builder().token(TOKEN).build()
@@ -1039,10 +1081,18 @@ def main():
     print("=" * 50)
     
     # Запускаем бота с параметрами для Railway
-    application.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES
-    )
+    try:
+        print("🔄 Запускаем бота с параметрами для Railway...")
+        application.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+            close_loop=False
+        )
+    except KeyboardInterrupt:
+        print("🛑 Бот остановлен пользователем")
+    except Exception as e:
+        print(f"❌ Критическая ошибка: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
