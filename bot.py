@@ -6,8 +6,18 @@ import asyncio
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+# Загружаем .env файл
 from dotenv import load_dotenv
-load_dotenv()
+import os
+
+# Пробуем загрузить из .env, если нет - из bot.env
+dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
+if not os.path.exists(dotenv_path):
+    dotenv_path = os.path.join(os.path.dirname(__file__), 'bot.env')
+    print(f"Использую bot.env: {dotenv_path}")
+
+load_dotenv(dotenv_path)
+print(f"Загружен файл: {dotenv_path}")
 
 # ========== НАСТРОЙКИ ==========
 TOKEN = os.environ.get('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
